@@ -1,0 +1,546 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/slack-go/slack"
+)
+
+// Message represents a unified message format
+type Message struct {
+	User        string
+	Channel     string
+	Text        string
+	ThreadTS    string
+	Timestamp   string
+	IsThread    bool
+	IsDM        bool
+	ChannelType string
+}
+
+// FeedAggregator aggregates messages from various sources
+type FeedAggregator struct {
+	client         *slack.Client
+	messages       []Message
+	channelInfo    map[string]*slack.Channel
+	userInfo       map[string]*slack.User
+	mu             sync.Mutex
+	outputCh       chan Message
+	feedTargetUser string
+	userID         string // Current user's ID
+}
+
+func NewFeedAggregator(token string, targetUserID string) (*FeedAggregator, error) {
+	client := slack.New(
+		token,
+		slack.OptionLog(log.New(os.Stdout, "slack-bot: ", log.Lshortfile|log.LstdFlags)),
+	)
+
+	// Test the token by getting user identity
+	authTest, err := client.AuthTest()
+	if err != nil {
+		return nil, fmt.Errorf("auth test failed: %w", err)
+	}
+
+	log.Printf("Connected to Slack as user: %s (ID: %s)", authTest.User, authTest.UserID)
+
+	return &FeedAggregator{
+		client:         client,
+		messages:       make([]Message, 0),
+		channelInfo:    make(map[string]*slack.Channel),
+		userInfo:       make(map[string]*slack.User),
+		outputCh:       make(chan Message, 100),
+		feedTargetUser: targetUserID,
+		userID:         authTest.UserID,
+	}, nil
+}
+
+// Start begins listening for messages
+func (fa *FeedAggregator) Start(ctx context.Context) error {
+	// Load initial channel and user information
+	if err := fa.loadInitialData(); err != nil {
+		return err
+	}
+
+	// Start the output processor
+	go fa.processOutputChannel(ctx)
+
+	// Instead of real-time processing, we'll poll for recent messages
+	go fa.pollForMessages(ctx)
+
+	// This keeps the main thread running
+	<-ctx.Done()
+	return nil
+}
+
+// loadInitialData loads channels and users info
+func (fa *FeedAggregator) loadInitialData() error {
+	// Get only conversations that the user is a member of
+	conversations, nextCursor, err := fa.client.GetConversationsForUser(&slack.GetConversationsForUserParameters{
+		Types:           []string{"public_channel", "private_channel", "mpim", "im"},
+		Limit:           1000,
+		ExcludeArchived: true,
+		UserID:          fa.userID, // Only get conversations the current user is a member of
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get user conversations: %w", err)
+	}
+
+	// Handle pagination if there are more conversations
+	for nextCursor != "" {
+		var additionalConversations []slack.Channel
+		additionalConversations, nextCursor, err = fa.client.GetConversationsForUser(&slack.GetConversationsForUserParameters{
+			Types:           []string{"public_channel", "private_channel", "mpim", "im"},
+			Limit:           1000,
+			Cursor:          nextCursor,
+			ExcludeArchived: true,
+			UserID:          fa.userID,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to get additional user conversations: %w", err)
+		}
+		conversations = append(conversations, additionalConversations...)
+	}
+
+	// Store all channels the user is a member of
+	memberChannels := 0
+	for _, channel := range conversations {
+		fa.channelInfo[channel.ID] = &channel
+		memberChannels++
+
+		// Log channel info
+		channelType := "channel"
+		if channel.IsIM {
+			channelType = "direct message"
+		} else if channel.IsMpIM {
+			channelType = "group DM"
+		} else if channel.IsPrivate {
+			channelType = "private channel"
+		}
+
+		log.Printf("Added %s: %s (%s)", channelType, channel.ID, channel.Name)
+	}
+
+	log.Printf("User is a member of %d conversations", memberChannels)
+
+	// Get all users
+	users, err := fa.client.GetUsers()
+	if err != nil {
+		return fmt.Errorf("failed to get users: %w", err)
+	}
+
+	log.Printf("Found %d users", len(users))
+	for _, user := range users {
+		fa.userInfo[user.ID] = &user
+	}
+
+	return nil
+}
+
+// pollForMessages periodically checks channels for new messages, one channel every 10 seconds
+func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Track the latest timestamp we've processed for each channel
+	latestTimestamps := make(map[string]string)
+
+	// Initialize the map with current time to only get messages from now on
+	now := fmt.Sprintf("%d.000000", time.Now().Unix())
+
+	// Create a slice of channel IDs to process (only where user is a member)
+	channelIDs := make([]string, 0, len(fa.channelInfo))
+	for channelID := range fa.channelInfo {
+		channelIDs = append(channelIDs, channelID)
+		latestTimestamps[channelID] = now
+	}
+
+	log.Println("Starting message polling (1 channel every 500 ms)...")
+	log.Printf("Will process %d channels in rotation (only where user is a member)", len(channelIDs))
+
+	// Track which channel to process next
+	currentChannelIndex := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Skip if there are no channels to process
+			if len(channelIDs) == 0 {
+				log.Println("No channels to process")
+				continue
+			}
+
+			// Get the next channel ID to process
+			channelID := channelIDs[currentChannelIndex]
+			channel, exists := fa.channelInfo[channelID]
+			fmt.Printf("channel: %+v\n", channel)
+
+			// Update the index for next time
+			currentChannelIndex = (currentChannelIndex + 1) % len(channelIDs)
+
+			// Log which channel we're processing
+			// channelName := channelID
+			// if channel != nil && channel.Name != "" {
+			// 	channelName = channel.Name
+			// }
+			//log.Printf("Processing channel %s (%d of %d)", channelName, currentChannelIndex+1, len(channelIDs))
+
+			// Skip if the channel doesn't exist or is archived
+			if !exists || (channel != nil && channel.IsArchived) {
+				log.Printf("Skipping channel %s (archived or inaccessible)", channelID)
+				continue
+			}
+
+			// Get history since the last check
+			params := &slack.GetConversationHistoryParameters{
+				ChannelID: channelID,
+				Oldest:    latestTimestamps[channelID],
+				Limit:     100,
+			}
+
+			history, err := fa.client.GetConversationHistory(params)
+			if err != nil {
+				log.Printf("Error getting history for channel %s: %v", channelID, err)
+				continue
+			}
+
+			if len(history.Messages) > 0 {
+				log.Printf("Found %d new messages in %s", len(history.Messages), channelID)
+
+				// Process messages (newest first)
+				for i := len(history.Messages) - 1; i >= 0; i-- {
+					msg := history.Messages[i]
+
+					// Skip messages from self to avoid loops
+					if msg.User == fa.userID {
+						continue
+					}
+
+					// Determine channel type
+					channelType := "channel"
+					isDM := false
+
+					if channel, ok := fa.channelInfo[channelID]; ok {
+						if channel.IsIM {
+							channelType = "direct_message"
+							isDM = true
+						} else if channel.IsMpIM {
+							channelType = "group_dm"
+							isDM = true
+						} else if channel.IsPrivate {
+							channelType = "private_channel"
+						}
+					}
+
+					message := Message{
+						User:        msg.User,
+						Channel:     channelID,
+						Text:        msg.Text,
+						ThreadTS:    msg.ThreadTimestamp,
+						Timestamp:   msg.Timestamp,
+						IsThread:    msg.ThreadTimestamp != "",
+						IsDM:        isDM,
+						ChannelType: channelType,
+					}
+
+					fa.addMessage(message)
+
+					// If message has threads, get thread replies
+					if msg.ReplyCount > 0 {
+						replies, hasMore, nextCursor, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
+							ChannelID: channelID,
+							Timestamp: msg.Timestamp,
+						})
+
+						if err != nil {
+							log.Printf("Error getting thread replies for %s: %v", msg.Timestamp, err)
+							continue
+						}
+
+						// Process thread replies
+						for _, reply := range replies {
+							// Skip if it's the parent message or from self
+							if reply.Timestamp == msg.Timestamp || reply.User == fa.userID {
+								continue
+							}
+
+							threadMessage := Message{
+								User:        reply.User,
+								Channel:     channelID,
+								Text:        reply.Text,
+								ThreadTS:    reply.ThreadTimestamp,
+								Timestamp:   reply.Timestamp,
+								IsThread:    true,
+								IsDM:        isDM,
+								ChannelType: channelType,
+							}
+							fa.addMessage(threadMessage)
+						}
+
+						// Handle pagination for large threads if needed
+						for hasMore {
+							moreReplies, moreHasMore, _, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
+								ChannelID: channelID,
+								Timestamp: msg.Timestamp,
+								Cursor:    nextCursor,
+							})
+
+							if err != nil {
+								log.Printf("Error getting additional thread replies: %v", err)
+								break
+							}
+
+							// Process additional replies
+							for _, reply := range moreReplies {
+								// Skip if it's already processed or from self
+								if reply.Timestamp == msg.Timestamp || reply.User == fa.userID {
+									continue
+								}
+
+								threadMessage := Message{
+									User:        reply.User,
+									Channel:     channelID,
+									Text:        reply.Text,
+									ThreadTS:    reply.ThreadTimestamp,
+									Timestamp:   reply.Timestamp,
+									IsThread:    true,
+									IsDM:        isDM,
+									ChannelType: channelType,
+								}
+								fa.addMessage(threadMessage)
+							}
+
+							hasMore = moreHasMore
+						}
+					}
+				}
+
+				// Update latest timestamp for this channel
+				// We take the timestamp of the newest message
+				latestTimestamps[channelID] = history.Messages[0].Timestamp
+			}
+		}
+	}
+}
+
+// addMessage adds a message to the feed
+func (fa *FeedAggregator) addMessage(msg Message) {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+
+	fa.messages = append(fa.messages, msg)
+
+	// Also send to output channel
+	select {
+	case fa.outputCh <- msg:
+		// Message sent successfully
+	default:
+		log.Println("Output channel full, message dropped")
+	}
+}
+
+// GetMessages returns all aggregated messages
+func (fa *FeedAggregator) GetMessages() []Message {
+	fa.mu.Lock()
+	defer fa.mu.Unlock()
+
+	// Create a copy to avoid race conditions
+	result := make([]Message, len(fa.messages))
+	copy(result, fa.messages)
+
+	return result
+}
+
+// processOutputChannel handles messages sent to the output channel
+func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
+	// Target for feed messages
+	var targetChannelID string
+
+	// If a specific target user/channel was specified
+	if fa.feedTargetUser != "" {
+		// Special case: if the target is "self", find the user's own DM with Slackbot
+		// This is a workaround if we don't have permission to open DMs
+		if fa.feedTargetUser == "self" {
+			// Look for the slackbot DM as a fallback
+			for channelID, channel := range fa.channelInfo {
+				if channel.IsIM && channel.User == "USLACKBOT" {
+					targetChannelID = channelID
+					log.Printf("Found Slackbot DM channel %s for feed messages", targetChannelID)
+
+					// Send welcome message
+					welcomeText := "👋 *Feed Aggregator is now active!*\nI'll send all aggregated messages to this conversation with Slackbot."
+					_, _, err := fa.client.PostMessage(targetChannelID, slack.MsgOptionText(welcomeText, false))
+					if err != nil {
+						log.Printf("Error sending welcome message: %v", err)
+					}
+					break
+				}
+			}
+
+			if targetChannelID == "" {
+				log.Println("Couldn't find Slackbot DM, will only log to console")
+			}
+		} else {
+			// Try to find an existing DM with the target user
+			for channelID, channel := range fa.channelInfo {
+				if channel.IsIM && channel.User == fa.feedTargetUser {
+					targetChannelID = channelID
+					log.Printf("Found existing DM channel %s with user %s for feed messages",
+						targetChannelID, fa.feedTargetUser)
+
+					// Send welcome message
+					welcomeText := "👋 *Feed Aggregator is now active!*\nI'll send all aggregated messages to this conversation."
+					_, _, err := fa.client.PostMessage(targetChannelID, slack.MsgOptionText(welcomeText, false))
+					if err != nil {
+						log.Printf("Error sending welcome message: %v", err)
+					}
+					break
+				}
+			}
+
+			if targetChannelID == "" {
+				log.Printf("Couldn't find existing DM with user %s, attempting to open one", fa.feedTargetUser)
+
+				// Attempt to open a DM channel with the target user
+				try, _, _, err := fa.client.OpenConversation(&slack.OpenConversationParameters{
+					Users: []string{fa.feedTargetUser},
+				})
+				if err != nil {
+					log.Printf("Error opening DM with user %s: %v", fa.feedTargetUser, err)
+					log.Println("Will only log messages to console. To enable DM functionality, add im:write scope to your token.")
+				} else {
+					targetChannelID = try.ID
+					log.Printf("Opened DM channel %s with user %s for feed messages", targetChannelID, fa.feedTargetUser)
+
+					// Send welcome message
+					welcomeText := "👋 *Feed Aggregator is now active!*\nI'll send all aggregated messages to this conversation."
+					_, _, err := fa.client.PostMessage(targetChannelID, slack.MsgOptionText(welcomeText, false))
+					if err != nil {
+						log.Printf("Error sending welcome message: %v", err)
+					}
+				}
+			}
+		}
+	}
+
+	// Keep track of when we last sent a message to avoid flooding
+	lastMessageTime := time.Now()
+	batchedMessages := make([]string, 0)
+	const batchThreshold = 5 // Number of messages to collect before sending
+	const minTimeBetweenBatches = 3 * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-fa.outputCh:
+			// Format the message
+			userName := msg.User
+			if user, ok := fa.userInfo[msg.User]; ok {
+				userName = user.RealName
+			}
+
+			channelName := msg.Channel
+			if channel, ok := fa.channelInfo[msg.Channel]; ok {
+				channelName = channel.Name
+
+				// For DMs, use the other user's name
+				if channel.IsIM {
+					for userID := range fa.userInfo {
+						if channel.User == userID {
+							channelName = fmt.Sprintf("DM with %s", fa.userInfo[userID].RealName)
+							break
+						}
+					}
+				}
+			}
+
+			messageType := "message"
+			if msg.IsThread {
+				messageType = "thread reply"
+			}
+
+			formattedMsg := fmt.Sprintf("*[%s]* `%s` in *%s* (%s):\n> %s",
+				time.Unix(convertTimestamp(msg.Timestamp), 0).Format("2006-01-02 15:04:05"),
+				userName,
+				channelName,
+				messageType,
+				msg.Text,
+			)
+
+			// Always log to console
+			log.Println(formattedMsg)
+
+			// If we have a target channel, send there too
+			if targetChannelID != "" {
+				// Add to batch
+				batchedMessages = append(batchedMessages, formattedMsg)
+
+				// Send batch if we have enough messages or enough time has passed
+				if len(batchedMessages) >= batchThreshold || time.Since(lastMessageTime) > minTimeBetweenBatches {
+					// Join messages with a divider
+					messageText := ""
+					for i, m := range batchedMessages {
+						if i > 0 {
+							messageText += "\n\n---\n\n"
+						}
+						messageText += m
+					}
+
+					// Send to DM
+					_, _, err := fa.client.PostMessage(targetChannelID,
+						slack.MsgOptionText(messageText, false),
+					)
+					if err != nil {
+						log.Printf("Error sending message to channel: %v", err)
+					}
+
+					// Reset batch
+					batchedMessages = make([]string, 0)
+					lastMessageTime = time.Now()
+				}
+			}
+		}
+	}
+}
+
+// Helper to convert Slack timestamp to Unix timestamp
+func convertTimestamp(timestamp string) int64 {
+	var ts float64
+	fmt.Sscanf(timestamp, "%f", &ts)
+	return int64(ts)
+}
+
+func main() {
+	// Get token from environment variables
+	token := os.Getenv("SLACK_USER_TOKEN")
+	targetUserID := os.Getenv("SLACK_TARGET_USER_ID")
+
+	if token == "" {
+		log.Fatal("SLACK_USER_TOKEN must be set")
+	}
+
+	if targetUserID == "" {
+		log.Println("SLACK_TARGET_USER_ID not set. To send messages to yourself, set it to 'self'")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	aggregator, err := NewFeedAggregator(token, targetUserID)
+	if err != nil {
+		log.Fatalf("Error creating feed aggregator: %v", err)
+	}
+
+	log.Println("Starting feed aggregator...")
+	if err := aggregator.Start(ctx); err != nil {
+		log.Fatalf("Error starting feed aggregator: %v", err)
+	}
+}
