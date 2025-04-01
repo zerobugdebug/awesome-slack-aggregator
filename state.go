@@ -37,12 +37,15 @@ type StateManager struct {
 
 // NewStateManager creates a new state manager
 func NewStateManager(stateDir string) (*StateManager, error) {
+
+	cleanedStateDir := filepath.Clean(stateDir)
+	log.Info().Str("stateDir", stateDir).Str("cleanedStateDir", cleanedStateDir).Msg("Folders: ")
 	// Ensure directory exists
-	if err := os.MkdirAll(stateDir, 0755); err != nil {
+	if err := os.MkdirAll(cleanedStateDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create state directory: %w", err)
 	}
 
-	filePath := filepath.Join(stateDir, "feed_aggregator_state.json")
+	filePath := filepath.Join(cleanedStateDir, "slack-feed.state")
 
 	sm := &StateManager{
 		data: StateData{
