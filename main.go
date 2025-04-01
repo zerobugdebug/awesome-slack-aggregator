@@ -294,6 +294,9 @@ func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	// Add a delay between channel checks
+	channelCheckDelay := 250 * time.Millisecond
+
 	// Track the latest timestamp we've processed for each channel
 	latestTimestamps := make(map[string]string)
 
@@ -343,7 +346,8 @@ func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
 
 	log.Info().
 		Int("channel_count", len(channelIDs)).
-		Str("interval", "1s").
+		Str("interval", "2s").
+		Dur("channelCheckDelay", channelCheckDelay).
 		Msg("Starting message polling")
 
 	// Track which channel to process next
@@ -371,174 +375,114 @@ func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
 				Int("total", len(channelIDs)).
 				Msg("Processing channel")
 
-			// Update the index for next time
+			// Update the index for next time - this ensures we distribute API calls
+			// across different channels even if we add delays
 			currentChannelIndex = (currentChannelIndex + 1) % len(channelIDs)
 
-			// Skip if the channel doesn't exist or is archived
-			if !exists || (channel != nil && channel.IsArchived) {
-				log.Debug().
-					Str("channelID", channelID).
-					Str("channelName", fa.getChannelDisplayName(channelID)).
-					Msg("Skipping channel (archived or inaccessible)")
-				continue
-			}
-
-			// Get history since the last check
-			params := &slack.GetConversationHistoryParameters{
-				ChannelID: channelID,
-				Oldest:    latestTimestamps[channelID],
-				Limit:     100,
-			}
-
-			log.Trace().
-				Str("channelID", channelID).
-				Str("channelName", fa.getChannelDisplayName(channelID)).
-				Str("oldest", latestTimestamps[channelID]).
-				Msg("Fetching conversation history")
-
-			history, err := fa.client.GetConversationHistory(params)
-			if err != nil {
-				log.Error().
-					Err(err).
-					Str("channelID", channelID).
-					Str("channelName", fa.getChannelDisplayName(channelID)).
-					Msg("Error getting history for channel")
-				continue
-			}
-
-			if len(history.Messages) > 0 {
-				log.Debug().
-					Str("channelID", channelID).
-					Str("channelName", fa.getChannelDisplayName(channelID)).
-					Int("message_count", len(history.Messages)).
-					Msg("Found new messages")
-
-				// Process messages (newest first)
-				for i := len(history.Messages) - 1; i >= 0; i-- {
-					msg := history.Messages[i]
-					// Skip messages created by this app (look for our marker)
-					if fa.messageFormatter.IsAppMessage(msg.Text) {
-						log.Debug().
-							Str("timestamp", msg.Timestamp).
-							Str("channelID", channelID).
-							Msg("Skipping message created by this app")
-						continue
-					}
-
-					// Determine channel type
-					channelType := "channel"
-					isDM := false
-
-					if channel, ok := fa.channelInfo[channelID]; ok {
-						if channel.IsIM {
-							channelType = "direct_message"
-							isDM = true
-						} else if channel.IsMpIM {
-							channelType = "group_dm"
-							isDM = true
-						} else if channel.IsPrivate {
-							channelType = "private_channel"
-						}
-					}
-
-					message := Message{
-						User:        msg.User,
-						Channel:     channelID,
-						Text:        msg.Text,
-						ThreadTS:    msg.ThreadTimestamp,
-						Timestamp:   msg.Timestamp,
-						IsThread:    msg.ThreadTimestamp != "",
-						IsDM:        isDM,
-						ChannelType: channelType,
-					}
-
+			// Process the channel in a separate goroutine to avoid blocking the ticker
+			go func(channelID string, channel *slack.Channel, exists bool) {
+				// Skip if the channel doesn't exist or is archived
+				if !exists || (channel != nil && channel.IsArchived) {
 					log.Debug().
-						Str("user", msg.User).
-						Str("userName", fa.getUserDisplayName(msg.User)).
-						Str("timestamp", msg.Timestamp).
 						Str("channelID", channelID).
 						Str("channelName", fa.getChannelDisplayName(channelID)).
-						Str("type", channelType).
-						Bool("isThread", msg.ThreadTimestamp != "").
-						Msg("Adding message")
+						Msg("Skipping channel (archived or inaccessible)")
+					return
+				}
 
-					fa.addMessage(message)
+				// Get history since the last check
+				params := &slack.GetConversationHistoryParameters{
+					ChannelID: channelID,
+					Oldest:    latestTimestamps[channelID],
+					Limit:     100,
+				}
 
-					// If message has threads, get thread replies
-					if msg.ReplyCount > 0 {
-						log.Debug().
-							Str("messageTS", msg.Timestamp).
-							Str("channelID", channelID).
-							Str("channelName", fa.getChannelDisplayName(channelID)).
-							Int("replyCount", msg.ReplyCount).
-							Msg("Fetching thread replies")
+				log.Trace().
+					Str("channelID", channelID).
+					Str("channelName", fa.getChannelDisplayName(channelID)).
+					Str("oldest", latestTimestamps[channelID]).
+					Msg("Fetching conversation history")
 
-						replies, hasMore, nextCursor, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
-							ChannelID: channelID,
-							Timestamp: msg.Timestamp,
-						})
+				history, err := fa.client.GetConversationHistory(params)
+				if err != nil {
+					log.Error().
+						Err(err).
+						Str("channelID", channelID).
+						Str("channelName", fa.getChannelDisplayName(channelID)).
+						Msg("Error getting history for channel")
+					return
+				}
 
-						if err != nil {
-							log.Error().
-								Err(err).
+				if len(history.Messages) > 0 {
+					log.Debug().
+						Str("channelID", channelID).
+						Str("channelName", fa.getChannelDisplayName(channelID)).
+						Int("message_count", len(history.Messages)).
+						Msg("Found new messages")
+
+					// Process messages (newest first)
+					for i := len(history.Messages) - 1; i >= 0; i-- {
+						msg := history.Messages[i]
+						// Skip messages created by this app (look for our marker)
+						if fa.messageFormatter.IsAppMessage(msg.Text) {
+							log.Debug().
+								Str("timestamp", msg.Timestamp).
 								Str("channelID", channelID).
-								Str("channelName", fa.getChannelDisplayName(channelID)).
-								Str("messageTS", msg.Timestamp).
-								Msg("Error getting thread replies")
+								Msg("Skipping message created by this app")
 							continue
 						}
 
-						// Process thread replies
-						log.Trace().
-							Int("replyCount", len(replies)).
-							Str("channelID", channelID).
-							Str("channelName", fa.getChannelDisplayName(channelID)).
-							Msg("Processing thread replies")
-						for _, reply := range replies {
-							// Skip if it's the parent message or from self
-							if reply.Timestamp == msg.Timestamp || reply.User == fa.userID {
-								log.Trace().
-									Str("replyTS", reply.Timestamp).
-									Msg("Skipping parent message or own reply")
-								continue
+						// Determine channel type
+						channelType := "channel"
+						isDM := false
+
+						if channel, ok := fa.channelInfo[channelID]; ok {
+							if channel.IsIM {
+								channelType = "direct_message"
+								isDM = true
+							} else if channel.IsMpIM {
+								channelType = "group_dm"
+								isDM = true
+							} else if channel.IsPrivate {
+								channelType = "private_channel"
 							}
-
-							threadMessage := Message{
-								User:        reply.User,
-								Channel:     channelID,
-								Text:        reply.Text,
-								ThreadTS:    reply.ThreadTimestamp,
-								Timestamp:   reply.Timestamp,
-								IsThread:    true,
-								IsDM:        isDM,
-								ChannelType: channelType,
-							}
-
-							log.Debug().
-								Str("user", reply.User).
-								Str("userName", fa.getUserDisplayName(reply.User)).
-								Str("timestamp", reply.Timestamp).
-								Str("channelID", channelID).
-								Str("channelName", fa.getChannelDisplayName(channelID)).
-								Str("threadTS", reply.ThreadTimestamp).
-								Msg("Adding thread reply")
-
-							fa.addMessage(threadMessage)
 						}
 
-						// Handle pagination for large threads if needed
-						for hasMore {
+						message := Message{
+							User:        msg.User,
+							Channel:     channelID,
+							Text:        msg.Text,
+							ThreadTS:    msg.ThreadTimestamp,
+							Timestamp:   msg.Timestamp,
+							IsThread:    msg.ThreadTimestamp != "",
+							IsDM:        isDM,
+							ChannelType: channelType,
+						}
+
+						log.Debug().
+							Str("user", msg.User).
+							Str("userName", fa.getUserDisplayName(msg.User)).
+							Str("timestamp", msg.Timestamp).
+							Str("channelID", channelID).
+							Str("channelName", fa.getChannelDisplayName(channelID)).
+							Str("type", channelType).
+							Bool("isThread", msg.ThreadTimestamp != "").
+							Msg("Adding message")
+
+						fa.addMessage(message)
+
+						// If message has threads, get thread replies - with delays between API calls
+						if msg.ReplyCount > 0 {
 							log.Debug().
 								Str("messageTS", msg.Timestamp).
 								Str("channelID", channelID).
 								Str("channelName", fa.getChannelDisplayName(channelID)).
-								Str("cursor", nextCursor).
-								Msg("Fetching more thread replies")
+								Int("replyCount", msg.ReplyCount).
+								Msg("Fetching thread replies")
 
-							moreReplies, moreHasMore, nextCursorNew, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
+							replies, hasMore, nextCursor, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
 								ChannelID: channelID,
 								Timestamp: msg.Timestamp,
-								Cursor:    nextCursor,
 							})
 
 							if err != nil {
@@ -547,21 +491,18 @@ func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
 									Str("channelID", channelID).
 									Str("channelName", fa.getChannelDisplayName(channelID)).
 									Str("messageTS", msg.Timestamp).
-									Str("cursor", nextCursor).
-									Msg("Error getting additional thread replies")
-								break
+									Msg("Error getting thread replies")
+								continue
 							}
 
-							nextCursor = nextCursorNew
-
-							// Process additional replies
+							// Process thread replies
 							log.Trace().
-								Int("additionalReplyCount", len(moreReplies)).
+								Int("replyCount", len(replies)).
 								Str("channelID", channelID).
 								Str("channelName", fa.getChannelDisplayName(channelID)).
-								Msg("Processing additional thread replies")
-							for _, reply := range moreReplies {
-								// Skip if it's already processed or from self
+								Msg("Processing thread replies")
+							for _, reply := range replies {
+								// Skip if it's the parent message or from self
 								if reply.Timestamp == msg.Timestamp || reply.User == fa.userID {
 									log.Trace().
 										Str("replyTS", reply.Timestamp).
@@ -587,34 +528,104 @@ func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
 									Str("channelID", channelID).
 									Str("channelName", fa.getChannelDisplayName(channelID)).
 									Str("threadTS", reply.ThreadTimestamp).
-									Msg("Adding additional thread reply")
+									Msg("Adding thread reply")
 
 								fa.addMessage(threadMessage)
 							}
 
-							hasMore = moreHasMore
+							// Handle pagination for large threads if needed - with delays
+							for hasMore {
+								// Add delay before fetching more replies
+								time.Sleep(channelCheckDelay)
+
+								log.Debug().
+									Str("messageTS", msg.Timestamp).
+									Str("channelID", channelID).
+									Str("channelName", fa.getChannelDisplayName(channelID)).
+									Str("cursor", nextCursor).
+									Msg("Fetching more thread replies")
+
+								moreReplies, moreHasMore, nextCursorNew, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
+									ChannelID: channelID,
+									Timestamp: msg.Timestamp,
+									Cursor:    nextCursor,
+								})
+
+								if err != nil {
+									log.Error().
+										Err(err).
+										Str("channelID", channelID).
+										Str("channelName", fa.getChannelDisplayName(channelID)).
+										Str("messageTS", msg.Timestamp).
+										Str("cursor", nextCursor).
+										Msg("Error getting additional thread replies")
+									break
+								}
+
+								nextCursor = nextCursorNew
+
+								// Process additional replies
+								log.Trace().
+									Int("additionalReplyCount", len(moreReplies)).
+									Str("channelID", channelID).
+									Str("channelName", fa.getChannelDisplayName(channelID)).
+									Msg("Processing additional thread replies")
+								for _, reply := range moreReplies {
+									// Skip if it's already processed or from self
+									if reply.Timestamp == msg.Timestamp || reply.User == fa.userID {
+										log.Trace().
+											Str("replyTS", reply.Timestamp).
+											Msg("Skipping parent message or own reply")
+										continue
+									}
+
+									threadMessage := Message{
+										User:        reply.User,
+										Channel:     channelID,
+										Text:        reply.Text,
+										ThreadTS:    reply.ThreadTimestamp,
+										Timestamp:   reply.Timestamp,
+										IsThread:    true,
+										IsDM:        isDM,
+										ChannelType: channelType,
+									}
+
+									log.Debug().
+										Str("user", reply.User).
+										Str("userName", fa.getUserDisplayName(reply.User)).
+										Str("timestamp", reply.Timestamp).
+										Str("channelID", channelID).
+										Str("channelName", fa.getChannelDisplayName(channelID)).
+										Str("threadTS", reply.ThreadTimestamp).
+										Msg("Adding additional thread reply")
+
+									fa.addMessage(threadMessage)
+								}
+
+								hasMore = moreHasMore
+							}
+
+							// Track this thread for future updates
+							fa.trackThread(channelID, msg.Timestamp)
 						}
-
-						// Track this thread for future updates
-						fa.trackThread(channelID, msg.Timestamp)
+						// Also track this message as recent for future thread detection
+						fa.stateManager.TrackRecentMessage(channelID, msg.Timestamp)
 					}
-					// Also track this message as recent for future thread detection
-					fa.stateManager.TrackRecentMessage(channelID, msg.Timestamp)
+
+					// Update latest timestamp for this channel
+					// We take the timestamp of the newest message
+					latestTimestamps[channelID] = history.Messages[0].Timestamp
+
+					// Save to persistent storage
+					fa.stateManager.SetLatestTimestamp(channelID, latestTimestamps[channelID])
+
+					log.Debug().
+						Str("channelID", channelID).
+						Str("channelName", fa.getChannelDisplayName(channelID)).
+						Str("newLatestTS", latestTimestamps[channelID]).
+						Msg("Updated latest timestamp for channel")
 				}
-
-				// Update latest timestamp for this channel
-				// We take the timestamp of the newest message
-				latestTimestamps[channelID] = history.Messages[0].Timestamp
-
-				// Save to persistent storage
-				fa.stateManager.SetLatestTimestamp(channelID, latestTimestamps[channelID])
-
-				log.Debug().
-					Str("channelID", channelID).
-					Str("channelName", fa.getChannelDisplayName(channelID)).
-					Str("newLatestTS", latestTimestamps[channelID]).
-					Msg("Updated latest timestamp for channel")
-			}
+			}(channelID, channel, exists)
 		}
 	}
 }
@@ -739,7 +750,46 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 		params.Oldest = fmt.Sprintf("%d.000000", lastKnownActivity.Unix()) // Only get newer messages
 	}
 
-	replies, hasMore, nextCursor, err := fa.client.GetConversationReplies(params)
+	// Adding a retry mechanism for API failures
+	maxRetries := 3
+	retryDelay := 500 * time.Millisecond
+	var replies []slack.Message
+	var hasMore bool
+	var nextCursor string
+	var err error
+
+	// Try up to maxRetries times with increasing delay
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			log.Warn().
+				Str("channelID", channelID).
+				Str("channelName", fa.getChannelDisplayName(channelID)).
+				Str("threadTS", threadTS).
+				Int("retry", retry).
+				Dur("delay", retryDelay).
+				Msg("Retrying thread update API call")
+
+			// Exponential backoff
+			time.Sleep(retryDelay)
+			retryDelay *= 2
+		}
+
+		replies, hasMore, nextCursor, err = fa.client.GetConversationReplies(params)
+
+		if err == nil {
+			break
+		}
+
+		// Rate limited or temporary error, try again
+		log.Error().
+			Err(err).
+			Str("channelID", channelID).
+			Str("channelName", fa.getChannelDisplayName(channelID)).
+			Str("threadTS", threadTS).
+			Int("retry", retry+1).
+			Int("maxRetries", maxRetries).
+			Msg("Error getting thread updates, will retry")
+	}
 
 	if err != nil {
 		log.Error().
@@ -747,17 +797,18 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 			Str("channelID", channelID).
 			Str("channelName", fa.getChannelDisplayName(channelID)).
 			Str("threadTS", threadTS).
-			Msg("Error getting thread updates")
+			Msg("Failed to get thread updates after multiple retries")
 		return
 	}
 
 	// Process replies (if any)
 	hasNewActivity := false
 	newestActivity := lastKnownActivity
+	processedCount := 0
 
 	for _, reply := range replies {
 		// Skip the parent message and self messages
-		if reply.Timestamp == threadTS {
+		if reply.Timestamp == threadTS || reply.User == fa.userID {
 			continue
 		}
 
@@ -793,16 +844,26 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 
 			// Add to message feed
 			fa.tryAddUniqueMessage(threadMessage)
+			processedCount++
 		}
 	}
 
 	// Handle pagination for large threads if needed
+	// Define delay between pagination requests
+	paginationDelay := 200 * time.Millisecond
+	paginationCount := 0
+
 	for hasMore {
+		// Add delay before fetching more replies
+		time.Sleep(paginationDelay)
+		paginationCount++
+
 		log.Debug().
 			Str("threadTS", threadTS).
 			Str("channelID", channelID).
 			Str("channelName", fa.getChannelDisplayName(channelID)).
 			Str("cursor", nextCursor).
+			Int("paginationCount", paginationCount).
 			Msg("Fetching more thread replies")
 
 		params := &slack.GetConversationRepliesParameters{
@@ -816,16 +877,43 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 			params.Oldest = fmt.Sprintf("%d.000000", lastKnownActivity.Unix()) // Only get newer messages
 		}
 
-		moreReplies, moreHasMore, nextCursorNew, err := fa.client.GetConversationReplies(params)
+		// Add retry logic for pagination as well
+		var moreReplies []slack.Message
+		var moreHasMore bool
+		var nextCursorNew string
+		var paginationErr error
 
-		if err != nil {
+		for retry := 0; retry < maxRetries; retry++ {
+			if retry > 0 {
+				log.Warn().
+					Str("channelID", channelID).
+					Str("channelName", fa.getChannelDisplayName(channelID)).
+					Str("threadTS", threadTS).
+					Str("cursor", nextCursor).
+					Int("retry", retry).
+					Dur("delay", retryDelay).
+					Msg("Retrying pagination API call")
+
+				// Exponential backoff
+				time.Sleep(retryDelay)
+				retryDelay *= 2
+			}
+
+			moreReplies, moreHasMore, nextCursorNew, paginationErr = fa.client.GetConversationReplies(params)
+
+			if paginationErr == nil {
+				break
+			}
+		}
+
+		if paginationErr != nil {
 			log.Error().
-				Err(err).
+				Err(paginationErr).
 				Str("channelID", channelID).
 				Str("channelName", fa.getChannelDisplayName(channelID)).
 				Str("threadTS", threadTS).
 				Str("cursor", nextCursor).
-				Msg("Error getting additional thread replies")
+				Msg("Error getting additional thread replies after retries")
 			break
 		}
 
@@ -870,6 +958,7 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 
 				// Add to message feed
 				fa.tryAddUniqueMessage(threadMessage)
+				processedCount++
 			}
 		}
 
@@ -895,6 +984,7 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 			Str("channelName", fa.getChannelDisplayName(channelID)).
 			Str("threadTS", threadTS).
 			Time("newLastActivity", newestActivity).
+			Int("newMessagesProcessed", processedCount).
 			Msg("Updated thread activity timestamp")
 	}
 
@@ -928,6 +1018,9 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 	moderateThreshold := 3 * 24 * time.Hour // Threads with activity in the last 3 days
 	lowThreshold := 7 * 24 * time.Hour      // Threads with activity in the last week
 
+	// Define delay between API requests to avoid overloading
+	threadCheckDelay := 200 * time.Millisecond
+
 	// Expiry threshold
 	expiryThreshold := time.Duration(fa.threadExpiryDays) * 24 * time.Hour
 
@@ -937,6 +1030,7 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 		Dur("activeThreshold", activeThreshold).
 		Dur("moderateThreshold", moderateThreshold).
 		Dur("lowThreshold", lowThreshold).
+		Dur("checkDelay", threadCheckDelay).
 		Dur("expiryThreshold", expiryThreshold).
 		Msg("Starting thread update polling with tiered frequency")
 
@@ -954,8 +1048,16 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 
 			now := time.Now()
 			threadCount := 0
-			processedCount := 0
 			expiredCount := 0
+
+			// Instead of processing threads immediately, collect those that need updating
+			type threadCheck struct {
+				channelID    string
+				threadTS     string
+				lastActivity time.Time
+			}
+
+			threadsToCheck := make([]threadCheck, 0)
 
 			for channelID, threads := range activeThreadsCopy {
 				// Initialize the inner map if needed
@@ -1003,9 +1105,9 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 					var pollInterval time.Duration
 
 					if timeSinceActivity <= veryActiveThreshold {
-						pollInterval = 30 * time.Second // Very active: check every minute
+						pollInterval = 30 * time.Second // Very active: check every 30 seconds
 					} else if timeSinceActivity <= activeThreshold {
-						pollInterval = 3 * time.Minute // Active: check every 5 minutes
+						pollInterval = 3 * time.Minute // Active: check every 3 minutes
 					} else if timeSinceActivity <= moderateThreshold {
 						pollInterval = 15 * time.Minute // Moderate: check every 15 minutes
 					} else {
@@ -1015,22 +1117,50 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 					// Check if it's time to poll this thread
 					lastThreadPoll, exists := lastPolled[channelID][threadTS]
 					if !exists || now.Sub(lastThreadPoll) >= pollInterval {
-						// Time to check this thread
-						fa.checkThreadUpdates(channelID, threadTS, info.LastActivity)
+						// Time to check this thread - add to our queue
+						threadsToCheck = append(threadsToCheck, threadCheck{
+							channelID:    channelID,
+							threadTS:     threadTS,
+							lastActivity: info.LastActivity,
+						})
 
 						// Update last poll time
 						lastPolled[channelID][threadTS] = now
-						processedCount++
 					}
 				}
 			}
 
-			if threadCount > 0 {
+			// Now process the threads with delays between them
+			// Spawn a separate goroutine to not block the ticker
+			if len(threadsToCheck) > 0 {
+				go func(threads []threadCheck) {
+					for i, thread := range threads {
+						// Check this thread
+						fa.checkThreadUpdates(thread.channelID, thread.threadTS, thread.lastActivity)
+
+						// Add delay before next check (unless it's the last one)
+						if i < len(threads)-1 {
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(threadCheckDelay):
+								// Continue to next thread
+							}
+						}
+					}
+
+					log.Debug().
+						Int("totalThreads", threadCount).
+						Int("checkedThreads", len(threads)).
+						Int("expiredThreads", expiredCount).
+						Msg("Completed thread check cycle with delays")
+				}(threadsToCheck)
+			} else if threadCount > 0 {
 				log.Debug().
 					Int("totalThreads", threadCount).
-					Int("processedThreads", processedCount).
+					Int("checkedThreads", 0).
 					Int("expiredThreads", expiredCount).
-					Msg("Checked for updates to active threads")
+					Msg("No threads needed checking in this cycle")
 			}
 		}
 	}
@@ -1378,12 +1508,16 @@ func (fa *FeedAggregator) pollForNewThreads(ctx context.Context) {
 	// How far back to track recent messages for possible thread creation
 	messageTrackingPeriod := 24 * time.Hour // Track messages for 24 hours
 
+	// Define delay between API requests
+	requestDelay := 150 * time.Millisecond
+
 	// Check recent messages every minute
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	log.Info().
 		Dur("trackingPeriod", messageTrackingPeriod).
+		Dur("requestDelay", requestDelay).
 		Str("checkInterval", "1m").
 		Msg("Starting recent message thread detection")
 
@@ -1402,11 +1536,14 @@ func (fa *FeedAggregator) pollForNewThreads(ctx context.Context) {
 			// Get a snapshot of recent messages
 			recentMessages := fa.stateManager.GetRecentMessages()
 
-			// Track stats
-			checkedCount := 0
-			newThreadsFound := 0
+			// Collect messages that need checking
+			type checkInfo struct {
+				channelID string
+				messageTS string
+			}
+			messagesToCheck := make([]checkInfo, 0)
 
-			// Check each recent message for threads
+			// Identify which messages need checking
 			for channelID, messages := range recentMessages {
 				// Skip if the channel doesn't exist or is archived
 				channel, exists := fa.channelInfo[channelID]
@@ -1415,8 +1552,6 @@ func (fa *FeedAggregator) pollForNewThreads(ctx context.Context) {
 				}
 
 				for messageTS := range messages {
-					checkedCount++
-
 					// Check if this message is already being tracked as a thread
 					isTrackedThread := false
 					fa.threadMu.Lock()
@@ -1425,61 +1560,81 @@ func (fa *FeedAggregator) pollForNewThreads(ctx context.Context) {
 					}
 					fa.threadMu.Unlock()
 
-					if isTrackedThread {
-						// Already tracking this thread, skip
-						continue
-					}
-
-					// Get message info from Slack to check for thread replies
-					log.Debug().
-						Str("channelID", channelID).
-						Str("channelName", fa.getChannelDisplayName(channelID)).
-						Str("messageTS", messageTS).
-						Msg("Checking recent message for new thread activity")
-
-					// Use GetConversationHistory with inclusive oldest/latest to get just this message
-					history, err := fa.client.GetConversationHistory(&slack.GetConversationHistoryParameters{
-						ChannelID: channelID,
-						Oldest:    messageTS,
-						Latest:    messageTS,
-						Inclusive: true,
-						Limit:     1,
-					})
-
-					if err != nil {
-						log.Error().
-							Err(err).
-							Str("channelID", channelID).
-							Str("messageTS", messageTS).
-							Msg("Error checking message for thread activity")
-						continue
-					}
-
-					// If we got the message and it now has thread replies
-					if len(history.Messages) > 0 && history.Messages[0].ReplyCount > 0 {
-						log.Info().
-							Str("channelID", channelID).
-							Str("channelName", fa.getChannelDisplayName(channelID)).
-							Str("messageTS", messageTS).
-							Int("replyCount", history.Messages[0].ReplyCount).
-							Msg("Found new thread on recent message")
-
-						// Add this to thread tracking
-						fa.trackThread(channelID, messageTS)
-
-						// Get all the thread replies and process them
-						fa.checkThreadUpdates(channelID, messageTS, time.Time{}) // Empty time means get all replies
-
-						newThreadsFound++
+					if !isTrackedThread {
+						messagesToCheck = append(messagesToCheck, checkInfo{
+							channelID: channelID,
+							messageTS: messageTS,
+						})
 					}
 				}
 			}
 
-			if checkedCount > 0 {
-				log.Debug().
-					Int("checkedMessages", checkedCount).
-					Int("newThreadsFound", newThreadsFound).
-					Msg("Completed check for new threads on recent messages")
+			// Process messages that need checking with delays between each request
+			if len(messagesToCheck) > 0 {
+				go func(messages []checkInfo) {
+					checkedCount := 0
+					newThreadsFound := 0
+
+					for i, msg := range messages {
+						// Check this message for thread activity
+						log.Debug().
+							Str("channelID", msg.channelID).
+							Str("channelName", fa.getChannelDisplayName(msg.channelID)).
+							Str("messageTS", msg.messageTS).
+							Msg("Checking recent message for new thread activity")
+
+						// Use GetConversationHistory with inclusive oldest/latest to get just this message
+						history, err := fa.client.GetConversationHistory(&slack.GetConversationHistoryParameters{
+							ChannelID: msg.channelID,
+							Oldest:    msg.messageTS,
+							Latest:    msg.messageTS,
+							Inclusive: true,
+							Limit:     1,
+						})
+
+						checkedCount++
+
+						if err != nil {
+							log.Error().
+								Err(err).
+								Str("channelID", msg.channelID).
+								Str("messageTS", msg.messageTS).
+								Msg("Error checking message for thread activity")
+						} else if len(history.Messages) > 0 && history.Messages[0].ReplyCount > 0 {
+							log.Info().
+								Str("channelID", msg.channelID).
+								Str("channelName", fa.getChannelDisplayName(msg.channelID)).
+								Str("messageTS", msg.messageTS).
+								Int("replyCount", history.Messages[0].ReplyCount).
+								Msg("Found new thread on recent message")
+
+							// Add this to thread tracking
+							fa.trackThread(msg.channelID, msg.messageTS)
+
+							// Get all the thread replies and process them
+							fa.checkThreadUpdates(msg.channelID, msg.messageTS, time.Time{}) // Empty time means get all replies
+
+							newThreadsFound++
+						}
+
+						// Add delay before next check (unless it's the last one)
+						if i < len(messages)-1 {
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(requestDelay):
+								// Continue to next message
+							}
+						}
+					}
+
+					if checkedCount > 0 {
+						log.Debug().
+							Int("checkedMessages", checkedCount).
+							Int("newThreadsFound", newThreadsFound).
+							Msg("Completed check for new threads on recent messages")
+					}
+				}(messagesToCheck)
 			}
 		}
 	}
