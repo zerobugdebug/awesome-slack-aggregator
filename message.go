@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -27,10 +28,7 @@ func NewMessageFormatter() *MessageFormatter {
 // FormatMessage formats a message link for sending
 func (mf *MessageFormatter) FormatMessage(teamDomain, channelID, timestamp, userRealName, channelName string) string {
 	// Create message link
-	linkTimestamp := timestamp
-	for _, c := range "." {
-		linkTimestamp = fmt.Sprintf("%s%c%s", linkTimestamp[:10], c, linkTimestamp[10:])
-	}
+	linkTimestamp := strings.Replace(timestamp, ".", "", 1)
 	messageLink := fmt.Sprintf("https://%s.slack.com/archives/%s/p%s",
 		teamDomain, channelID, linkTimestamp)
 
