@@ -18,7 +18,7 @@ type MessageFormatter struct {
 // NewMessageFormatter creates a new formatter with a unique ID
 func NewMessageFormatter() *MessageFormatter {
 	// Create a unique identifier for this instance
-	uniqueID := fmt.Sprintf("feed-%d", time.Now().Unix())
+	uniqueID := "FpHZFpdW"
 
 	return &MessageFormatter{
 		appTag: uniqueID,
@@ -33,8 +33,8 @@ func (mf *MessageFormatter) FormatMessage(teamDomain, channelID, timestamp, user
 		teamDomain, channelID, linkTimestamp)
 
 	// Format with app identifier
-	return fmt.Sprintf("[🤖] <%s|Message> from *%s* in *#%s* <!-- app-msg:%s -->",
-		messageLink, userRealName, channelName, mf.appTag)
+	return fmt.Sprintf("[🤖:%s] <%s|Message> from *%s* in *#%s*",
+		mf.appTag, messageLink, userRealName, channelName)
 }
 
 // IsAppMessage checks if a message was created by the app
