@@ -757,7 +757,7 @@ func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKno
 
 	for _, reply := range replies {
 		// Skip the parent message and self messages
-		if reply.Timestamp == threadTS || reply.User == fa.userID {
+		if reply.Timestamp == threadTS {
 			continue
 		}
 
