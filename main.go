@@ -1121,42 +1121,42 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 						Msg("Sending message batch")
 
 					// Process each message in the batch
-					combinedMessageSlice := []string{}
+
 					for _, batchMsg := range batchedMessages {
 						userName := fa.getUserDisplayName(batchMsg.User)
 						channelName := fa.getChannelDisplayName(batchMsg.Channel)
 
 						// Format message with our marker
-						combinedMessageSlice = append(combinedMessageSlice, fa.messageFormatter.FormatMessage(
+						messageText := fa.messageFormatter.FormatMessage(
 							fa.teamDomain,
 							batchMsg.Channel,
 							batchMsg.Timestamp,
 							userName,
 							channelName,
-						))
-					}
+						)
 
-					// Send to target channel
-					_, timestamp, err := fa.client.PostMessage(
-						targetChannelID,
-						slack.MsgOptionText(strings.Join(combinedMessageSlice, "\n"), false),
-					)
+						// Send to target channel
+						_, timestamp, err := fa.client.PostMessage(
+							targetChannelID,
+							slack.MsgOptionText(messageText, false),
+						)
 
-					if err != nil {
-						log.Error().
-							Err(err).
-							Str("targetChannelID", targetChannelID).
-							Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
-							Msg("Error sending message to channel")
-					} else {
-						log.Debug().
-							Str("targetChannelID", targetChannelID).
-							Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
-							Str("timestamp", timestamp).
-							Msg("Message sent successfully")
+						if err != nil {
+							log.Error().
+								Err(err).
+								Str("targetChannelID", targetChannelID).
+								Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
+								Msg("Error sending message to channel")
+						} else {
+							log.Debug().
+								Str("targetChannelID", targetChannelID).
+								Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
+								Str("timestamp", timestamp).
+								Msg("Message sent successfully")
 
-						// Track this message for retention
-						fa.stateManager.TrackSentMessage(timestamp, targetChannelID)
+							// Track this message for retention
+							fa.stateManager.TrackSentMessage(timestamp, targetChannelID)
+						}
 					}
 
 					// Reset batch
