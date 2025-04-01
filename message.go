@@ -33,14 +33,14 @@ func (mf *MessageFormatter) FormatMessage(teamDomain, channelID, timestamp, user
 		teamDomain, channelID, linkTimestamp)
 
 	// Format with app identifier
-	return fmt.Sprintf("[🤖 Feed Aggregator] New message from *%s* in *#%s*\n%s\n<!-- app-msg:%s -->",
-		userRealName, channelName, messageLink, mf.appTag)
+	return fmt.Sprintf("[🤖] <%s|Message> from *%s* in *#%s* <!-- app-msg:%s -->",
+		messageLink, userRealName, channelName, mf.appTag)
 }
 
 // IsAppMessage checks if a message was created by the app
 func (mf *MessageFormatter) IsAppMessage(text string) bool {
 	// Look for our special comment marker
-	return text != "" && (len(text) >= 12 && text[:12] == "[🤖 Feed Aggregator]")
+	return text != "" && (len(text) >= 12 && text[:12] == "[🤖]")
 }
 
 // MessageRetainer handles cleanup of old messages

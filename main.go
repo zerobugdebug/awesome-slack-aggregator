@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"maps"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -1271,7 +1270,7 @@ func (fa *FeedAggregator) tryAddUniqueMessage(msg Message) {
 func main() {
 	// Set up command line flags
 	logLevelStr := flag.String("log-level", "info", "Log level: trace, debug, info, warn, error, fatal, panic")
-	stateDir := flag.String("state-dir", "", "Directory for persistent state storage (default: $HOME/.slack-feed)")
+	stateDir := flag.String("state-dir", "slack-feed.state", "Directory for persistent state storage (default: $HOME/.slack-feed)")
 	retentionDays := flag.Int("retention", 7, "Number of days to retain messages before deletion")
 	flag.Parse()
 
@@ -1309,16 +1308,15 @@ func main() {
 	}
 
 	// Set up state directory
-	if *stateDir == "" {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			log.Error().Err(err).Msg("Could not determine home directory")
-			*stateDir = ".slack-feed" // Use current directory as fallback
-		} else {
-			*stateDir = filepath.Join(homeDir, ".slack-feed")
-		}
-
-	}
+	// if *stateDir == "" {
+	// 	homeDir, err := os.UserHomeDir()
+	// 	if err != nil {
+	// 		log.Error().Err(err).Msg("Could not determine home directory")
+	// 		*stateDir = ".slack-feed" // Use current directory as fallback
+	// 	} else {
+	// 		*stateDir = filepath.Join(homeDir, ".slack-feed")
+	// 	}
+	// }
 
 	log.Info().
 		Str("stateDir", *stateDir).

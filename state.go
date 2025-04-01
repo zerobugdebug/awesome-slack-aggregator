@@ -86,7 +86,7 @@ func countThreads(activeThreads map[string]map[string]time.Time) int {
 
 // Start begins the periodic saving of state
 func (sm *StateManager) Start() {
-	sm.saveTicker = time.NewTicker(30 * time.Second)
+	sm.saveTicker = time.NewTicker(1 * time.Second)
 
 	go func() {
 		for {
