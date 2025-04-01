@@ -1010,7 +1010,7 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 	lastMessageTime := time.Now()
 	batchedMessages := make([]Message, 0)
 	const batchThreshold = 1 // Number of messages to collect before sending
-	const minTimeBetweenBatches = 3 * time.Second
+	const minTimeBetweenBatches = 10 * time.Second
 
 	log.Debug().
 		Int("batchThreshold", batchThreshold).
@@ -1032,9 +1032,9 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 				Msg("Processing output message")
 
 			// Format the message
-			userName := msg.User
+			//userName := msg.User
 			if user, ok := fa.userInfo[msg.User]; ok {
-				userName = user.RealName
+				userName := user.RealName
 				log.Trace().
 					Str("userID", msg.User).
 					Str("userName", userName).
@@ -1045,9 +1045,9 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 					Msg("Could not resolve user name")
 			}
 
-			channelName := msg.Channel
+			//channelName := msg.Channel
 			if channel, ok := fa.channelInfo[msg.Channel]; ok {
-				channelName = channel.Name
+				channelName := channel.Name
 				log.Trace().
 					Str("channelID", msg.Channel).
 					Str("channelName", channelName).
@@ -1057,7 +1057,6 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 				if channel.IsIM {
 					for userID := range fa.userInfo {
 						if channel.User == userID {
-							channelName = fmt.Sprintf("DM with %s", fa.userInfo[userID].RealName)
 							log.Trace().
 								Str("channelID", msg.Channel).
 								Str("dmWithUser", fa.userInfo[userID].RealName).
