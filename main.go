@@ -291,7 +291,7 @@ func (fa *FeedAggregator) loadInitialData() error {
 
 // pollForMessages periodically checks channels for new messages
 func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
-	ticker := time.NewTicker(1000 * time.Millisecond)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
 	// Track the latest timestamp we've processed for each channel
