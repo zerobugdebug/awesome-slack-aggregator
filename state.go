@@ -12,15 +12,24 @@ import (
 )
 
 // StateData represents the persistent state of the application
+type ThreadInfo struct {
+	LastChecked  time.Time `json:"lastChecked"`
+	LastActivity time.Time `json:"lastActivity"`
+}
+
 type StateData struct {
 	// Map of channelID -> latest timestamp
 	LatestTimestamps map[string]string `json:"latestTimestamps"`
 
-	// Map of channelID -> map of threadTS -> last check time
-	ActiveThreads map[string]map[string]time.Time `json:"activeThreads"`
+	// Map of channelID -> map of threadTS -> thread info
+	ActiveThreads map[string]map[string]ThreadInfo `json:"activeThreads"`
 
 	// Map of timestamp -> channelID for messages sent by the app
 	SentMessages map[string]string `json:"sentMessages"`
+
+	// Map of channelID -> map of message timestamp -> discovery time
+	// Used to track recent messages that might get threads later
+	RecentMessages map[string]map[string]time.Time `json:"recentMessages"`
 
 	// Last time the state was saved
 	LastUpdated time.Time `json:"lastUpdated"`
@@ -50,8 +59,9 @@ func NewStateManager(stateDir string) (*StateManager, error) {
 	sm := &StateManager{
 		data: StateData{
 			LatestTimestamps: make(map[string]string),
-			ActiveThreads:    make(map[string]map[string]time.Time),
+			ActiveThreads:    make(map[string]map[string]ThreadInfo), // Changed from time.Time to ThreadInfo
 			SentMessages:     make(map[string]string),
+			RecentMessages:   make(map[string]map[string]time.Time), // Added RecentMessages
 			LastUpdated:      time.Now(),
 		},
 		filePath: filePath,
@@ -69,8 +79,9 @@ func NewStateManager(stateDir string) (*StateManager, error) {
 		log.Info().
 			Str("path", filePath).
 			Int("channels", len(sm.data.LatestTimestamps)).
-			Int("threads", countThreads(sm.data.ActiveThreads)).
+			Int("threads", countThreads(sm.data.ActiveThreads)). // Changed to use countThreadsInfo
 			Int("sentMessages", len(sm.data.SentMessages)).
+			Int("recentMessages", countRecentMessages(sm.data.RecentMessages)). // Added recentMessages count
 			Time("lastUpdated", sm.data.LastUpdated).
 			Msg("Loaded existing state")
 	}
@@ -78,11 +89,20 @@ func NewStateManager(stateDir string) (*StateManager, error) {
 	return sm, nil
 }
 
-// countThreads counts the total number of threads across all channels
-func countThreads(activeThreads map[string]map[string]time.Time) int {
+// countThreads counts the total number of ThreadInfo objects across all channels
+func countThreads(activeThreads map[string]map[string]ThreadInfo) int {
 	count := 0
 	for _, threads := range activeThreads {
 		count += len(threads)
+	}
+	return count
+}
+
+// countRecentMessages counts the total number of recent messages across all channels
+func countRecentMessages(recentMessages map[string]map[string]time.Time) int {
+	count := 0
+	for _, messages := range recentMessages {
+		count += len(messages)
 	}
 	return count
 }
@@ -180,34 +200,85 @@ func (sm *StateManager) SetLatestTimestamp(channelID, timestamp string) {
 }
 
 // GetActiveThreads returns a copy of the active threads map
-func (sm *StateManager) GetActiveThreads() map[string]map[string]time.Time {
+func (sm *StateManager) GetActiveThreads() map[string]map[string]ThreadInfo {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 
 	// Create a deep copy
-	result := make(map[string]map[string]time.Time)
+	result := make(map[string]map[string]ThreadInfo)
 	for channelID, threads := range sm.data.ActiveThreads {
-		result[channelID] = make(map[string]time.Time)
-		for threadTS, lastChecked := range threads {
-			result[channelID][threadTS] = lastChecked
+		result[channelID] = make(map[string]ThreadInfo)
+		for threadTS, info := range threads {
+			result[channelID][threadTS] = info
 		}
 	}
 
 	return result
 }
 
-// UpdateThreadTimestamp updates the last check time for a thread
-func (sm *StateManager) UpdateThreadTimestamp(channelID, threadTS string, timestamp time.Time) {
+// Add method to update activity time without changing check time
+func (sm *StateManager) UpdateThreadActivity(channelID, threadTS string, activityTime time.Time) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
 	// Initialize the inner map if needed
 	if _, exists := sm.data.ActiveThreads[channelID]; !exists {
-		sm.data.ActiveThreads[channelID] = make(map[string]time.Time)
+		sm.data.ActiveThreads[channelID] = make(map[string]ThreadInfo)
+	}
+
+	// Get existing info or create new
+	info, exists := sm.data.ActiveThreads[channelID][threadTS]
+	if !exists {
+		info = ThreadInfo{
+			LastChecked:  activityTime,
+			LastActivity: activityTime,
+		}
+	} else {
+		info.LastActivity = activityTime
+	}
+
+	// Update the thread info
+	sm.data.ActiveThreads[channelID][threadTS] = info
+}
+
+// UpdateThreadTimestamp updates the last check time for a thread
+func (sm *StateManager) UpdateThreadTimestamp(channelID, threadTS string, checkTime time.Time) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Initialize the inner map if needed
+	if _, exists := sm.data.ActiveThreads[channelID]; !exists {
+		sm.data.ActiveThreads[channelID] = make(map[string]ThreadInfo)
+	}
+
+	// Get existing info or create new
+	info, exists := sm.data.ActiveThreads[channelID][threadTS]
+	if !exists {
+		info = ThreadInfo{
+			LastChecked:  checkTime,
+			LastActivity: checkTime,
+		}
+	} else {
+		info.LastChecked = checkTime
 	}
 
 	// Update the timestamp
-	sm.data.ActiveThreads[channelID][threadTS] = timestamp
+	sm.data.ActiveThreads[channelID][threadTS] = info
+}
+
+// RemoveThreadTimestamp removes a thread from tracking
+func (sm *StateManager) RemoveThreadTimestamp(channelID, threadTS string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if threads, exists := sm.data.ActiveThreads[channelID]; exists {
+		delete(threads, threadTS)
+
+		// If no more threads in channel, remove channel entry
+		if len(threads) == 0 {
+			delete(sm.data.ActiveThreads, channelID)
+		}
+	}
 }
 
 // TrackSentMessage adds a sent message to the tracking
@@ -247,4 +318,61 @@ func (sm *StateManager) IsMessageSent(messageTS string) bool {
 
 	_, exists := sm.data.SentMessages[messageTS]
 	return exists
+}
+
+// TrackRecentMessage adds a message to the recent messages tracking
+func (sm *StateManager) TrackRecentMessage(channelID, messageTS string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Initialize the inner map if needed
+	if _, exists := sm.data.RecentMessages[channelID]; !exists {
+		sm.data.RecentMessages[channelID] = make(map[string]time.Time)
+	}
+
+	// Add the message with current time
+	sm.data.RecentMessages[channelID][messageTS] = time.Now()
+}
+
+// GetRecentMessages returns a copy of recent messages map
+func (sm *StateManager) GetRecentMessages() map[string]map[string]time.Time {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	// Create a deep copy
+	result := make(map[string]map[string]time.Time)
+	for channelID, messages := range sm.data.RecentMessages {
+		result[channelID] = make(map[string]time.Time)
+		for messageTS, discoveryTime := range messages {
+			result[channelID][messageTS] = discoveryTime
+		}
+	}
+
+	return result
+}
+
+// CleanupOldRecentMessages removes messages older than the retention period
+func (sm *StateManager) CleanupOldRecentMessages(retentionPeriod time.Duration) int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	removed := 0
+	now := time.Now()
+	cutoff := now.Add(-retentionPeriod)
+
+	for channelID, messages := range sm.data.RecentMessages {
+		for messageTS, discoveryTime := range messages {
+			if discoveryTime.Before(cutoff) {
+				delete(messages, messageTS)
+				removed++
+			}
+		}
+
+		// Remove empty channel entries
+		if len(messages) == 0 {
+			delete(sm.data.RecentMessages, channelID)
+		}
+	}
+
+	return removed
 }

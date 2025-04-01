@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"maps"
 	"os"
 	"strings"
 	"sync"
@@ -33,7 +32,8 @@ type FeedAggregator struct {
 	messages          []Message
 	channelInfo       map[string]*slack.Channel
 	userInfo          map[string]*slack.User
-	activeThreads     map[string]map[string]time.Time // Map of channelID -> map of threadTS -> last check time
+	activeThreads     map[string]map[string]ThreadInfo // Map of channelID -> map of threadTS -> thread info
+	threadExpiryDays  int                              // Days after which inactive threads are expired
 	mu                sync.Mutex
 	threadMu          sync.Mutex // Separate mutex for thread operations
 	outputCh          chan Message
@@ -92,7 +92,7 @@ func (a *slackLogAdapter) Output(calldepth int, s string) error {
 }
 
 // NewFeedAggregator creates a new feed aggregator
-func NewFeedAggregator(token string, targetUserID string, stateDir string, retentionDays int) (*FeedAggregator, error) {
+func NewFeedAggregator(token string, targetUserID string, stateDir string, retentionDays int, threadExpiryDays int) (*FeedAggregator, error) {
 	// Create a logger adapter for slack-go
 	slackLogger := &slackLogAdapter{
 		logger: log.With().Str("component", "slack-api").Logger(),
@@ -144,7 +144,7 @@ func NewFeedAggregator(token string, targetUserID string, stateDir string, reten
 		messages:          make([]Message, 0),
 		channelInfo:       make(map[string]*slack.Channel),
 		userInfo:          make(map[string]*slack.User),
-		activeThreads:     make(map[string]map[string]time.Time),
+		activeThreads:     make(map[string]map[string]ThreadInfo),
 		outputCh:          make(chan Message, 100),
 		feedTargetUser:    targetUserID,
 		userID:            authTest.UserID,
@@ -152,8 +152,8 @@ func NewFeedAggregator(token string, targetUserID string, stateDir string, reten
 		stateManager:      stateManager,
 		messageFormatter:  NewMessageFormatter(),
 		processedMessages: make(map[string]bool),
+		threadExpiryDays:  threadExpiryDays,
 	}
-
 	// Initialize message retainer
 	fa.messageRetainer = NewMessageRetainer(client, stateManager, retentionDays)
 
@@ -182,6 +182,10 @@ func (fa *FeedAggregator) Start(ctx context.Context) error {
 	// Start thread polling
 	log.Debug().Msg("Starting thread polling")
 	go fa.pollForThreadUpdates(ctx)
+
+	// Start recent message polling for new threads
+	log.Debug().Msg("Starting recent message polling")
+	go fa.pollForNewThreads(ctx)
 
 	// Start message polling
 	log.Debug().Msg("Starting message polling")
@@ -594,6 +598,8 @@ func (fa *FeedAggregator) pollForMessages(ctx context.Context) {
 						// Track this thread for future updates
 						fa.trackThread(channelID, msg.Timestamp)
 					}
+					// Also track this message as recent for future thread detection
+					fa.stateManager.TrackRecentMessage(channelID, msg.Timestamp)
 				}
 
 				// Update latest timestamp for this channel
@@ -667,12 +673,16 @@ func (fa *FeedAggregator) trackThread(channelID, threadTS string) {
 
 	// Initialize the inner map if needed
 	if _, exists := fa.activeThreads[channelID]; !exists {
-		fa.activeThreads[channelID] = make(map[string]time.Time)
+		fa.activeThreads[channelID] = make(map[string]ThreadInfo)
 	}
 
 	// Update the timestamp to now
 	now := time.Now()
-	fa.activeThreads[channelID][threadTS] = now
+	info := ThreadInfo{
+		LastChecked:  now,
+		LastActivity: now,
+	}
+	fa.activeThreads[channelID][threadTS] = info
 
 	// Update in persistent storage
 	fa.stateManager.UpdateThreadTimestamp(channelID, threadTS, now)
@@ -684,19 +694,254 @@ func (fa *FeedAggregator) trackThread(channelID, threadTS string) {
 		Msg("Added thread to active tracking")
 }
 
+// Helper method to check a specific thread for updates
+func (fa *FeedAggregator) checkThreadUpdates(channelID, threadTS string, lastKnownActivity time.Time) {
+	// Skip if the channel doesn't exist or is archived
+	channel, exists := fa.channelInfo[channelID]
+	if !exists || (channel != nil && channel.IsArchived) {
+		log.Debug().
+			Str("channelID", channelID).
+			Str("channelName", fa.getChannelDisplayName(channelID)).
+			Str("threadTS", threadTS).
+			Msg("Skipping thread in archived or inaccessible channel")
+		return
+	}
+
+	// Determine channel type
+	channelType := "channel"
+	isDM := false
+	if channel.IsIM {
+		channelType = "direct_message"
+		isDM = true
+	} else if channel.IsMpIM {
+		channelType = "group_dm"
+		isDM = true
+	} else if channel.IsPrivate {
+		channelType = "private_channel"
+	}
+
+	log.Debug().
+		Str("channelID", channelID).
+		Str("channelName", fa.getChannelDisplayName(channelID)).
+		Str("threadTS", threadTS).
+		Time("lastActivity", lastKnownActivity).
+		Msg("Checking for updates to thread")
+
+	// Get the thread replies
+	params := &slack.GetConversationRepliesParameters{
+		ChannelID: channelID,
+		Timestamp: threadTS,
+		Limit:     100,
+	}
+
+	// Only filter by time if we have a valid lastKnownActivity
+	if !lastKnownActivity.IsZero() {
+		params.Oldest = fmt.Sprintf("%d.000000", lastKnownActivity.Unix()) // Only get newer messages
+	}
+
+	replies, hasMore, nextCursor, err := fa.client.GetConversationReplies(params)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("channelID", channelID).
+			Str("channelName", fa.getChannelDisplayName(channelID)).
+			Str("threadTS", threadTS).
+			Msg("Error getting thread updates")
+		return
+	}
+
+	// Process replies (if any)
+	hasNewActivity := false
+	newestActivity := lastKnownActivity
+
+	for _, reply := range replies {
+		// Skip the parent message and self messages
+		if reply.Timestamp == threadTS || reply.User == fa.userID {
+			continue
+		}
+
+		// Convert timestamp to time
+		timestampFloat := 0.0
+		_, err := fmt.Sscanf(reply.Timestamp, "%f", &timestampFloat)
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("timestamp", reply.Timestamp).
+				Msg("Failed to parse timestamp")
+			continue
+		}
+
+		replyTime := time.Unix(int64(timestampFloat), 0)
+		if replyTime.After(lastKnownActivity) {
+			hasNewActivity = true
+			if replyTime.After(newestActivity) {
+				newestActivity = replyTime
+			}
+
+			// Process the new reply
+			threadMessage := Message{
+				User:        reply.User,
+				Channel:     channelID,
+				Text:        reply.Text,
+				ThreadTS:    reply.ThreadTimestamp,
+				Timestamp:   reply.Timestamp,
+				IsThread:    true,
+				IsDM:        isDM,
+				ChannelType: channelType,
+			}
+
+			// Add to message feed
+			fa.tryAddUniqueMessage(threadMessage)
+		}
+	}
+
+	// Handle pagination for large threads if needed
+	for hasMore {
+		log.Debug().
+			Str("threadTS", threadTS).
+			Str("channelID", channelID).
+			Str("channelName", fa.getChannelDisplayName(channelID)).
+			Str("cursor", nextCursor).
+			Msg("Fetching more thread replies")
+
+		params := &slack.GetConversationRepliesParameters{
+			ChannelID: channelID,
+			Timestamp: threadTS,
+			Cursor:    nextCursor,
+		}
+
+		// Only filter by time if we have a valid lastKnownActivity
+		if !lastKnownActivity.IsZero() {
+			params.Oldest = fmt.Sprintf("%d.000000", lastKnownActivity.Unix()) // Only get newer messages
+		}
+
+		moreReplies, moreHasMore, nextCursorNew, err := fa.client.GetConversationReplies(params)
+
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("channelID", channelID).
+				Str("channelName", fa.getChannelDisplayName(channelID)).
+				Str("threadTS", threadTS).
+				Str("cursor", nextCursor).
+				Msg("Error getting additional thread replies")
+			break
+		}
+
+		nextCursor = nextCursorNew
+
+		// Process additional replies
+		for _, reply := range moreReplies {
+			// Skip if it's the parent message or from self
+			if reply.Timestamp == threadTS || reply.User == fa.userID {
+				continue
+			}
+
+			// Convert timestamp to time
+			timestampFloat := 0.0
+			_, err := fmt.Sscanf(reply.Timestamp, "%f", &timestampFloat)
+			if err != nil {
+				log.Error().
+					Err(err).
+					Str("timestamp", reply.Timestamp).
+					Msg("Failed to parse timestamp")
+				continue
+			}
+
+			replyTime := time.Unix(int64(timestampFloat), 0)
+			if replyTime.After(lastKnownActivity) {
+				hasNewActivity = true
+				if replyTime.After(newestActivity) {
+					newestActivity = replyTime
+				}
+
+				// Process the new reply
+				threadMessage := Message{
+					User:        reply.User,
+					Channel:     channelID,
+					Text:        reply.Text,
+					ThreadTS:    reply.ThreadTimestamp,
+					Timestamp:   reply.Timestamp,
+					IsThread:    true,
+					IsDM:        isDM,
+					ChannelType: channelType,
+				}
+
+				// Add to message feed
+				fa.tryAddUniqueMessage(threadMessage)
+			}
+		}
+
+		hasMore = moreHasMore
+	}
+
+	// Update thread activity time if there was new activity
+	if hasNewActivity {
+		fa.threadMu.Lock()
+		if channelThreads, exists := fa.activeThreads[channelID]; exists {
+			if info, exists := channelThreads[threadTS]; exists {
+				info.LastActivity = newestActivity
+				channelThreads[threadTS] = info
+			}
+		}
+		fa.threadMu.Unlock()
+
+		// Update in persistent storage
+		fa.stateManager.UpdateThreadActivity(channelID, threadTS, newestActivity)
+
+		log.Debug().
+			Str("channelID", channelID).
+			Str("channelName", fa.getChannelDisplayName(channelID)).
+			Str("threadTS", threadTS).
+			Time("newLastActivity", newestActivity).
+			Msg("Updated thread activity timestamp")
+	}
+
+	// Also update the checked time
+	now := time.Now()
+	fa.threadMu.Lock()
+	if channelThreads, exists := fa.activeThreads[channelID]; exists {
+		if info, exists := channelThreads[threadTS]; exists {
+			info.LastChecked = now
+			channelThreads[threadTS] = info
+		}
+	}
+	fa.threadMu.Unlock()
+
+	// Update the last check time in persistent storage
+	fa.stateManager.UpdateThreadTimestamp(channelID, threadTS, now)
+}
+
 // pollForThreadUpdates periodically checks for updates to active threads
 func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 	// Use persistent storage to initialize active threads
 	fa.activeThreads = fa.stateManager.GetActiveThreads()
 
-	// Run thread polling at a different interval than normal polling
-	// to avoid overwhelming the API
-	ticker := time.NewTicker(5 * time.Second)
+	// Thread polling will now use a tiered approach
+	ticker := time.NewTicker(10 * time.Second) // Base polling interval
 	defer ticker.Stop()
 
+	// Define thread activity tiers for polling frequency
+	veryActiveThreshold := 6 * time.Hour    // Threads with activity in the last 6 hours
+	activeThreshold := 24 * time.Hour       // Threads with activity in the last 24 hours
+	moderateThreshold := 3 * 24 * time.Hour // Threads with activity in the last 3 days
+	lowThreshold := 7 * 24 * time.Hour      // Threads with activity in the last week
+
+	// Expiry threshold
+	expiryThreshold := time.Duration(fa.threadExpiryDays) * 24 * time.Hour
+
 	log.Info().
-		Str("interval", "5s").
-		Msg("Starting thread update polling")
+		Str("baseInterval", "10s").
+		Dur("veryActiveThreshold", veryActiveThreshold).
+		Dur("activeThreshold", activeThreshold).
+		Dur("moderateThreshold", moderateThreshold).
+		Dur("lowThreshold", lowThreshold).
+		Dur("expiryThreshold", expiryThreshold).
+		Msg("Starting thread update polling with tiered frequency")
+
+	// Track when each thread was last polled
+	lastPolled := make(map[string]map[string]time.Time)
 
 	for {
 		select {
@@ -707,165 +952,84 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 			// Get a snapshot of active threads to avoid deadlocks
 			activeThreadsCopy := fa.getActiveThreadsSnapshot()
 
+			now := time.Now()
 			threadCount := 0
+			processedCount := 0
+			expiredCount := 0
+
 			for channelID, threads := range activeThreadsCopy {
-				log.Debug().
-					Str("channelID", channelID).
-					Str("channelName", fa.getChannelDisplayName(channelID)).
-					Msg("Found thread in the channel")
-				for threadTS := range threads {
+				// Initialize the inner map if needed
+				if _, exists := lastPolled[channelID]; !exists {
+					lastPolled[channelID] = make(map[string]time.Time)
+				}
+
+				for threadTS, info := range threads {
 					threadCount++
 
-					// Skip if the channel doesn't exist or is archived
-					channel, exists := fa.channelInfo[channelID]
-					if !exists || (channel != nil && channel.IsArchived) {
+					// Check if thread has expired (no activity for expiryThreshold)
+					timeSinceActivity := now.Sub(info.LastActivity)
+					if timeSinceActivity > expiryThreshold {
 						log.Debug().
 							Str("channelID", channelID).
 							Str("channelName", fa.getChannelDisplayName(channelID)).
 							Str("threadTS", threadTS).
-							Msg("Skipping thread in archived or inaccessible channel")
+							Dur("inactiveDuration", timeSinceActivity).
+							Msg("Expiring inactive thread")
+
+						// Remove from tracking
+						fa.threadMu.Lock()
+						if channelThreads, exists := fa.activeThreads[channelID]; exists {
+							delete(channelThreads, threadTS)
+							if len(channelThreads) == 0 {
+								delete(fa.activeThreads, channelID)
+							}
+						}
+						fa.threadMu.Unlock()
+
+						// Remove from persistent storage
+						fa.stateManager.RemoveThreadTimestamp(channelID, threadTS)
+
+						// Remove from last polled
+						delete(lastPolled[channelID], threadTS)
+						if len(lastPolled[channelID]) == 0 {
+							delete(lastPolled, channelID)
+						}
+
+						expiredCount++
 						continue
 					}
 
-					// Determine channel type
-					channelType := "channel"
-					isDM := false
-					if channel.IsIM {
-						channelType = "direct_message"
-						isDM = true
-					} else if channel.IsMpIM {
-						channelType = "group_dm"
-						isDM = true
-					} else if channel.IsPrivate {
-						channelType = "private_channel"
+					// Determine polling frequency based on activity
+					var pollInterval time.Duration
+
+					if timeSinceActivity <= veryActiveThreshold {
+						pollInterval = 15 * time.Second // Very active: check every minute
+					} else if timeSinceActivity <= activeThreshold {
+						pollInterval = 1 * time.Minute // Active: check every 5 minutes
+					} else if timeSinceActivity <= moderateThreshold {
+						pollInterval = 5 * time.Minute // Moderate: check every 15 minutes
+					} else {
+						pollInterval = 15 * time.Minute // Low: check every hour
 					}
 
-					log.Debug().
-						Str("channelID", channelID).
-						Str("channelName", fa.getChannelDisplayName(channelID)).
-						Str("threadTS", threadTS).
-						Msg("Checking for updates to thread")
+					// Check if it's time to poll this thread
+					lastThreadPoll, exists := lastPolled[channelID][threadTS]
+					if !exists || now.Sub(lastThreadPoll) >= pollInterval {
+						// Time to check this thread
+						fa.checkThreadUpdates(channelID, threadTS, info.LastActivity)
 
-					// Get the thread replies
-					replies, hasMore, nextCursor, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
-						ChannelID: channelID,
-						Timestamp: threadTS,
-						Limit:     100,
-					})
-
-					if err != nil {
-						log.Error().
-							Err(err).
-							Str("channelID", channelID).
-							Str("channelName", fa.getChannelDisplayName(channelID)).
-							Str("threadTS", threadTS).
-							Msg("Error getting thread updates")
-						continue
+						// Update last poll time
+						lastPolled[channelID][threadTS] = now
+						processedCount++
 					}
-
-					// Find the newest reply timestamp
-					var newestTS string
-					for _, reply := range replies {
-						// Skip the parent message and self messages
-						if reply.Timestamp == threadTS || reply.User == fa.userID {
-							continue
-						}
-
-						if newestTS == "" || reply.Timestamp > newestTS {
-							newestTS = reply.Timestamp
-						}
-
-						// We'll process ALL replies in the thread because we want to
-						// make sure we don't miss anything. This covers new threads
-						// and replies to old threads.
-						threadMessage := Message{
-							User:        reply.User,
-							Channel:     channelID,
-							Text:        reply.Text,
-							ThreadTS:    reply.ThreadTimestamp,
-							Timestamp:   reply.Timestamp,
-							IsThread:    true,
-							IsDM:        isDM,
-							ChannelType: channelType,
-						}
-
-						// Use a special method that doesn't add duplicates
-						fa.tryAddUniqueMessage(threadMessage)
-					}
-
-					// Handle pagination for large threads if needed
-					for hasMore {
-						log.Debug().
-							Str("threadTS", threadTS).
-							Str("channelID", channelID).
-							Str("channelName", fa.getChannelDisplayName(channelID)).
-							Str("cursor", nextCursor).
-							Msg("Fetching more thread replies")
-
-						moreReplies, moreHasMore, nextCursorNew, err := fa.client.GetConversationReplies(&slack.GetConversationRepliesParameters{
-							ChannelID: channelID,
-							Timestamp: threadTS,
-							Cursor:    nextCursor,
-						})
-
-						if err != nil {
-							log.Error().
-								Err(err).
-								Str("channelID", channelID).
-								Str("channelName", fa.getChannelDisplayName(channelID)).
-								Str("threadTS", threadTS).
-								Str("cursor", nextCursor).
-								Msg("Error getting additional thread replies")
-							break
-						}
-
-						nextCursor = nextCursorNew
-
-						// Process additional replies
-						for _, reply := range moreReplies {
-							// Skip if it's the parent message or from self
-							if reply.Timestamp == threadTS || reply.User == fa.userID {
-								continue
-							}
-
-							if newestTS == "" || reply.Timestamp > newestTS {
-								newestTS = reply.Timestamp
-							}
-
-							threadMessage := Message{
-								User:        reply.User,
-								Channel:     channelID,
-								Text:        reply.Text,
-								ThreadTS:    reply.ThreadTimestamp,
-								Timestamp:   reply.Timestamp,
-								IsThread:    true,
-								IsDM:        isDM,
-								ChannelType: channelType,
-							}
-
-							// Use a special method that doesn't add duplicates
-							fa.tryAddUniqueMessage(threadMessage)
-						}
-
-						hasMore = moreHasMore
-					}
-
-					// Update the last check time for this thread
-					fa.threadMu.Lock()
-					if _, exists := fa.activeThreads[channelID]; exists {
-						fa.activeThreads[channelID][threadTS] = time.Now()
-					}
-					fa.threadMu.Unlock()
-
-					// Update the last check time for this thread in persistent storage
-					fa.stateManager.UpdateThreadTimestamp(channelID, threadTS, time.Now())
-
 				}
 			}
 
 			if threadCount > 0 {
 				log.Debug().
-					Int("threadCount", threadCount).
+					Int("totalThreads", threadCount).
+					Int("processedThreads", processedCount).
+					Int("expiredThreads", expiredCount).
 					Msg("Checked for updates to active threads")
 			}
 		}
@@ -1180,18 +1344,132 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 
 // getActiveThreadsSnapshot returns a copy of the active threads map
 // to avoid deadlocks when iterating over it
-func (fa *FeedAggregator) getActiveThreadsSnapshot() map[string]map[string]time.Time {
+func (fa *FeedAggregator) getActiveThreadsSnapshot() map[string]map[string]ThreadInfo {
 	fa.threadMu.Lock()
 	defer fa.threadMu.Unlock()
 
 	// Create a deep copy of the active threads map
-	result := make(map[string]map[string]time.Time)
+	result := make(map[string]map[string]ThreadInfo)
 	for channelID, threads := range fa.activeThreads {
-		result[channelID] = make(map[string]time.Time)
-		maps.Copy(result[channelID], threads)
+		result[channelID] = make(map[string]ThreadInfo)
+		for threadTS, info := range threads {
+			result[channelID][threadTS] = info
+		}
 	}
 
 	return result
+}
+
+// Add a new method to the FeedAggregator to periodically check recent messages for thread creation
+func (fa *FeedAggregator) pollForNewThreads(ctx context.Context) {
+	// How far back to track recent messages for possible thread creation
+	messageTrackingPeriod := 24 * time.Hour // Track messages for 24 hours
+
+	// Check recent messages every minute
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	log.Info().
+		Dur("trackingPeriod", messageTrackingPeriod).
+		Str("checkInterval", "1m").
+		Msg("Starting recent message thread detection")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Debug().Msg("Context done, stopping recent message polling")
+			return
+		case <-ticker.C:
+			// First, clean up old messages from tracking
+			removed := fa.stateManager.CleanupOldRecentMessages(messageTrackingPeriod)
+			if removed > 0 {
+				log.Debug().Int("removedCount", removed).Msg("Removed old messages from recent tracking")
+			}
+
+			// Get a snapshot of recent messages
+			recentMessages := fa.stateManager.GetRecentMessages()
+
+			// Track stats
+			checkedCount := 0
+			newThreadsFound := 0
+
+			// Check each recent message for threads
+			for channelID, messages := range recentMessages {
+				// Skip if the channel doesn't exist or is archived
+				channel, exists := fa.channelInfo[channelID]
+				if !exists || (channel != nil && channel.IsArchived) {
+					continue
+				}
+
+				for messageTS := range messages {
+					checkedCount++
+
+					// Check if this message is already being tracked as a thread
+					isTrackedThread := false
+					fa.threadMu.Lock()
+					if threads, exists := fa.activeThreads[channelID]; exists {
+						_, isTrackedThread = threads[messageTS]
+					}
+					fa.threadMu.Unlock()
+
+					if isTrackedThread {
+						// Already tracking this thread, skip
+						continue
+					}
+
+					// Get message info from Slack to check for thread replies
+					log.Debug().
+						Str("channelID", channelID).
+						Str("channelName", fa.getChannelDisplayName(channelID)).
+						Str("messageTS", messageTS).
+						Msg("Checking recent message for new thread activity")
+
+					// Use GetConversationHistory with inclusive oldest/latest to get just this message
+					history, err := fa.client.GetConversationHistory(&slack.GetConversationHistoryParameters{
+						ChannelID: channelID,
+						Oldest:    messageTS,
+						Latest:    messageTS,
+						Inclusive: true,
+						Limit:     1,
+					})
+
+					if err != nil {
+						log.Error().
+							Err(err).
+							Str("channelID", channelID).
+							Str("messageTS", messageTS).
+							Msg("Error checking message for thread activity")
+						continue
+					}
+
+					// If we got the message and it now has thread replies
+					if len(history.Messages) > 0 && history.Messages[0].ReplyCount > 0 {
+						log.Info().
+							Str("channelID", channelID).
+							Str("channelName", fa.getChannelDisplayName(channelID)).
+							Str("messageTS", messageTS).
+							Int("replyCount", history.Messages[0].ReplyCount).
+							Msg("Found new thread on recent message")
+
+						// Add this to thread tracking
+						fa.trackThread(channelID, messageTS)
+
+						// Get all the thread replies and process them
+						fa.checkThreadUpdates(channelID, messageTS, time.Time{}) // Empty time means get all replies
+
+						newThreadsFound++
+					}
+				}
+			}
+
+			if checkedCount > 0 {
+				log.Debug().
+					Int("checkedMessages", checkedCount).
+					Int("newThreadsFound", newThreadsFound).
+					Msg("Completed check for new threads on recent messages")
+			}
+		}
+	}
 }
 
 // tryAddUniqueMessage adds a message only if it doesn't already exist
@@ -1267,6 +1545,7 @@ func main() {
 	logLevelStr := flag.String("log-level", "info", "Log level: trace, debug, info, warn, error, fatal, panic")
 	stateDir := flag.String("state-dir", ".", "Directory for persistent state storage (default: currrent folder)")
 	retentionDays := flag.Int("retention", 7, "Number of days to retain messages before deletion")
+	threadExpiryDays := flag.Int("thread-expiry", 7, "Number of days of inactivity before thread tracking expires")
 	flag.Parse()
 
 	// Set up zerolog
@@ -1316,13 +1595,15 @@ func main() {
 	log.Info().
 		Str("stateDir", *stateDir).
 		Int("retentionDays", *retentionDays).
+		Int("threadExpiryDays", *threadExpiryDays).
 		Msg("Configuration loaded")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	log.Debug().Msg("Creating feed aggregator")
-	aggregator, err := NewFeedAggregator(token, targetUserID, *stateDir, *retentionDays)
+	aggregator, err := NewFeedAggregator(token, targetUserID, *stateDir, *retentionDays, *threadExpiryDays)
+
 	if err != nil {
 		log.Fatal().Err(err).Msg("Error creating feed aggregator")
 	}
