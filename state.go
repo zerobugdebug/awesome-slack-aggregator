@@ -173,7 +173,7 @@ func (sm *StateManager) save() error {
 		return fmt.Errorf("failed to write state file: %w", err)
 	}
 
-	log.Debug().
+	log.Trace().
 		Str("path", sm.filePath).
 		Int("channels", len(data.LatestTimestamps)).
 		Int("threads", countThreads(data.ActiveThreads)).
