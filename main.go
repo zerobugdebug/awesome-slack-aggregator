@@ -1175,6 +1175,10 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 	const batchThreshold = 5 // Number of messages to collect before sending
 	const minTimeBetweenBatches = 10 * time.Second
 
+	// Add a timer for flushing based on time
+	flushTicker := time.NewTicker(minTimeBetweenBatches / 2) // Check every 5 seconds
+	defer flushTicker.Stop()
+
 	log.Debug().
 		Int("batchThreshold", batchThreshold).
 		Str("minTimeBetweenBatches", minTimeBetweenBatches.String()).
@@ -1183,8 +1187,24 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Flush any remaining messages before exiting
+			if len(batchedMessages) > 0 {
+				sendBatch(fa, batchedMessages, targetChannelID)
+			}
 			log.Debug().Msg("Context done, stopping output processor")
 			return
+		case <-flushTicker.C:
+			// Check if we need to flush due to time
+			if len(batchedMessages) > 0 && time.Since(lastMessageTime) > minTimeBetweenBatches {
+				log.Debug().
+					Int("batchSize", len(batchedMessages)).
+					Str("timeSinceLastBatch", time.Since(lastMessageTime).String()).
+					Msg("Flushing message batch due to time")
+
+				sendBatch(fa, batchedMessages, targetChannelID)
+				batchedMessages = make([]Message, 0)
+				lastMessageTime = time.Now()
+			}
 		case msg := <-fa.outputCh:
 			log.Debug().
 				Str("user", msg.User).
@@ -1276,68 +1296,61 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 					Int("batchSize", len(batchedMessages)).
 					Msg("Added message to batch")
 
-				// Send batch if we have enough messages or enough time has passed
-				timeSinceLastBatch := time.Since(lastMessageTime)
-				if len(batchedMessages) >= batchThreshold || timeSinceLastBatch > minTimeBetweenBatches {
+				// Send batch if we have enough messages
+				if len(batchedMessages) >= batchThreshold {
 					log.Debug().
 						Int("batchSize", len(batchedMessages)).
-						Str("timeSinceLastBatch", timeSinceLastBatch.String()).
-						Msg("Sending message batch")
+						Msg("Sending message batch due to size threshold")
 
-					// Process each message in the batch
-
-					for _, batchMsg := range batchedMessages {
-						userName := fa.getUserDisplayName(batchMsg.User)
-						channelName := fa.getChannelDisplayName(batchMsg.Channel)
-
-						// Format message with our marker
-						messageText := fa.messageFormatter.FormatMessage(
-							fa.teamDomain,
-							batchMsg.Channel,
-							batchMsg.Timestamp,
-							userName,
-							channelName,
-						)
-
-						// Send to target channel
-						_, timestamp, err := fa.client.PostMessage(
-							targetChannelID,
-							slack.MsgOptionText(messageText, false),
-						)
-
-						if err != nil {
-							log.Error().
-								Err(err).
-								Str("targetChannelID", targetChannelID).
-								Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
-								Msg("Error sending message to channel")
-						} else {
-							log.Debug().
-								Str("targetChannelID", targetChannelID).
-								Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
-								Str("timestamp", timestamp).
-								Msg("Message sent successfully")
-
-							// Track this message for retention
-							fa.stateManager.TrackSentMessage(timestamp, targetChannelID)
-						}
-					}
-
-					// Reset batch
+					sendBatch(fa, batchedMessages, targetChannelID)
 					batchedMessages = make([]Message, 0)
 					lastMessageTime = time.Now()
-					log.Trace().Msg("Reset batch state")
-				} else {
-					log.Trace().
-						Int("batchSize", len(batchedMessages)).
-						Str("timeSinceLastBatch", timeSinceLastBatch.String()).
-						Int("batchThreshold", batchThreshold).
-						Str("minTimeBetweenBatches", minTimeBetweenBatches.String()).
-						Msg("Batch threshold not reached, waiting for more messages")
 				}
+
 			} else {
 				log.Debug().Msg("No target channel found, skipping message send")
 			}
+		}
+	}
+}
+
+// Extract the batch sending logic to a helper function to avoid code duplication
+func sendBatch(fa *FeedAggregator, batchMessages []Message, targetChannelID string) {
+	// Process each message in the batch
+	for _, batchMsg := range batchMessages {
+		userName := fa.getUserDisplayName(batchMsg.User)
+		channelName := fa.getChannelDisplayName(batchMsg.Channel)
+
+		// Format message with our marker
+		messageText := fa.messageFormatter.FormatMessage(
+			fa.teamDomain,
+			batchMsg.Channel,
+			batchMsg.Timestamp,
+			userName,
+			channelName,
+		)
+
+		// Send to target channel
+		_, timestamp, err := fa.client.PostMessage(
+			targetChannelID,
+			slack.MsgOptionText(messageText, false),
+		)
+
+		if err != nil {
+			log.Error().
+				Err(err).
+				Str("targetChannelID", targetChannelID).
+				Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
+				Msg("Error sending message to channel")
+		} else {
+			log.Debug().
+				Str("targetChannelID", targetChannelID).
+				Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
+				Str("timestamp", timestamp).
+				Msg("Message sent successfully")
+
+			// Track this message for retention
+			fa.stateManager.TrackSentMessage(timestamp, targetChannelID)
 		}
 	}
 }
