@@ -1008,7 +1008,7 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 	// Keep track of when we last sent a message to avoid flooding
 	lastMessageTime := time.Now()
 	batchedMessages := make([]Message, 0)
-	const batchThreshold = 1 // Number of messages to collect before sending
+	const batchThreshold = 5 // Number of messages to collect before sending
 	const minTimeBetweenBatches = 10 * time.Second
 
 	log.Debug().
@@ -1070,11 +1070,6 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 					Msg("Could not resolve channel name")
 			}
 
-			// messageType := "message"
-			// if msg.IsThread {
-			// 	messageType = "thread reply"
-			// }
-
 			// Create message link - format: https://team-domain.slack.com/archives/CHANNEL_ID/p{TIMESTAMP_WITHOUT_DOT}
 			// Need to replace the dot in timestamp with empty string
 			linkTimestamp := strings.Replace(msg.Timestamp, ".", "", 1)
@@ -1126,42 +1121,42 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 						Msg("Sending message batch")
 
 					// Process each message in the batch
-
+					combinedMessageSlice := []string{}
 					for _, batchMsg := range batchedMessages {
 						userName := fa.getUserDisplayName(batchMsg.User)
 						channelName := fa.getChannelDisplayName(batchMsg.Channel)
 
 						// Format message with our marker
-						messageText := fa.messageFormatter.FormatMessage(
+						combinedMessageSlice = append(combinedMessageSlice, fa.messageFormatter.FormatMessage(
 							fa.teamDomain,
 							batchMsg.Channel,
 							batchMsg.Timestamp,
 							userName,
 							channelName,
-						)
+						))
+					}
 
-						// Send to target channel
-						_, timestamp, err := fa.client.PostMessage(
-							targetChannelID,
-							slack.MsgOptionText(messageText, false),
-						)
+					// Send to target channel
+					_, timestamp, err := fa.client.PostMessage(
+						targetChannelID,
+						slack.MsgOptionText(strings.Join(combinedMessageSlice, "\n"), false),
+					)
 
-						if err != nil {
-							log.Error().
-								Err(err).
-								Str("targetChannelID", targetChannelID).
-								Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
-								Msg("Error sending message to channel")
-						} else {
-							log.Debug().
-								Str("targetChannelID", targetChannelID).
-								Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
-								Str("timestamp", timestamp).
-								Msg("Message sent successfully")
+					if err != nil {
+						log.Error().
+							Err(err).
+							Str("targetChannelID", targetChannelID).
+							Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
+							Msg("Error sending message to channel")
+					} else {
+						log.Debug().
+							Str("targetChannelID", targetChannelID).
+							Str("targetChannelName", fa.getChannelDisplayName(targetChannelID)).
+							Str("timestamp", timestamp).
+							Msg("Message sent successfully")
 
-							// Track this message for retention
-							fa.stateManager.TrackSentMessage(timestamp, targetChannelID)
-						}
+						// Track this message for retention
+						fa.stateManager.TrackSentMessage(timestamp, targetChannelID)
 					}
 
 					// Reset batch
@@ -1270,7 +1265,7 @@ func (fa *FeedAggregator) tryAddUniqueMessage(msg Message) {
 func main() {
 	// Set up command line flags
 	logLevelStr := flag.String("log-level", "info", "Log level: trace, debug, info, warn, error, fatal, panic")
-	stateDir := flag.String("state-dir", "slack-feed.state", "Directory for persistent state storage (default: $HOME/.slack-feed)")
+	stateDir := flag.String("state-dir", ".", "Directory for persistent state storage (default: currrent folder)")
 	retentionDays := flag.Int("retention", 7, "Number of days to retain messages before deletion")
 	flag.Parse()
 
