@@ -1003,13 +1003,13 @@ func (fa *FeedAggregator) pollForThreadUpdates(ctx context.Context) {
 					var pollInterval time.Duration
 
 					if timeSinceActivity <= veryActiveThreshold {
-						pollInterval = 15 * time.Second // Very active: check every minute
+						pollInterval = 30 * time.Second // Very active: check every minute
 					} else if timeSinceActivity <= activeThreshold {
-						pollInterval = 1 * time.Minute // Active: check every 5 minutes
+						pollInterval = 3 * time.Minute // Active: check every 5 minutes
 					} else if timeSinceActivity <= moderateThreshold {
-						pollInterval = 5 * time.Minute // Moderate: check every 15 minutes
+						pollInterval = 15 * time.Minute // Moderate: check every 15 minutes
 					} else {
-						pollInterval = 15 * time.Minute // Low: check every hour
+						pollInterval = 1 * time.Hour // Low: check every hour
 					}
 
 					// Check if it's time to poll this thread
