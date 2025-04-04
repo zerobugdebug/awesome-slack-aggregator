@@ -33,14 +33,14 @@ func (mf *MessageFormatter) FormatMessage(teamDomain, channelID, timestamp, user
 		teamDomain, channelID, linkTimestamp)
 
 	// Format with app identifier
-	return fmt.Sprintf("[🤖:%s] <%s|Message> from *%s* in *#%s*",
-		mf.appTag, messageLink, userRealName, channelName)
+	return fmt.Sprintf("`%s` <%s|Message> in *#%s*",
+		mf.appTag, messageLink, channelName)
 }
 
 // IsAppMessage checks if a message was created by the app
 func (mf *MessageFormatter) IsAppMessage(text string) bool {
 	// Look for our special comment marker
-	return text != "" && (len(text) >= 12 && text[:12] == "[🤖]")
+	return text != "" && (len(text) >= len(mf.appTag) && strings.Contains(text, mf.appTag))
 }
 
 // MessageRetainer handles cleanup of old messages
