@@ -25,23 +25,28 @@ type BatchCheckRequest struct {
 	MessageTSs []string
 }
 
+// ThreadProcessor is an interface for components that can process messages
+type ThreadProcessor interface {
+	addMessage(msg Message)
+	getChannelDisplayName(channelID string) string
+	getUserDisplayName(userID string) string
+}
+
 // ThreadManager handles all thread-related operations with rate limiting
 type ThreadManager struct {
-	client            *slack.Client
-	threadCheckQueue  chan ThreadCheckRequest
-	batchCheckQueue   chan BatchCheckRequest
-	activeThreads     map[string]map[string]ThreadInfo
-	channelInfo       map[string]*slack.Channel
-	userInfo          map[string]*slack.User
-	stateManager      *StateManager
-	userID            string
-	outputCh          chan Message
-	threadMu          sync.RWMutex
-	requestDelay      time.Duration
-	maxRetries        int
-	threadExpiryDays  int
-	processedMessages map[string]bool
-	processedMu       sync.Mutex
+	client           *slack.Client
+	threadCheckQueue chan ThreadCheckRequest
+	batchCheckQueue  chan BatchCheckRequest
+	activeThreads    map[string]map[string]ThreadInfo
+	channelInfo      map[string]*slack.Channel
+	userInfo         map[string]*slack.User
+	stateManager     *StateManager
+	userID           string
+	processor        ThreadProcessor // Interface for forwarding messages to FeedAggregator
+	threadMu         sync.RWMutex
+	requestDelay     time.Duration
+	maxRetries       int
+	threadExpiryDays int
 }
 
 // NewThreadManager creates a new thread manager
@@ -51,24 +56,22 @@ func NewThreadManager(
 	userInfo map[string]*slack.User,
 	stateManager *StateManager,
 	userID string,
-	outputCh chan Message,
+	processor ThreadProcessor,
 	threadExpiryDays int,
-	processedMessages map[string]bool,
 ) *ThreadManager {
 	return &ThreadManager{
-		client:            client,
-		threadCheckQueue:  make(chan ThreadCheckRequest, 1000),
-		batchCheckQueue:   make(chan BatchCheckRequest, 100),
-		activeThreads:     make(map[string]map[string]ThreadInfo),
-		channelInfo:       channelInfo,
-		userInfo:          userInfo,
-		stateManager:      stateManager,
-		userID:            userID,
-		outputCh:          outputCh,
-		requestDelay:      300 * time.Millisecond, // Default request delay
-		maxRetries:        3,                      // Default max retries
-		threadExpiryDays:  threadExpiryDays,
-		processedMessages: processedMessages,
+		client:           client,
+		threadCheckQueue: make(chan ThreadCheckRequest, 1000),
+		batchCheckQueue:  make(chan BatchCheckRequest, 100),
+		activeThreads:    make(map[string]map[string]ThreadInfo),
+		channelInfo:      channelInfo,
+		userInfo:         userInfo,
+		stateManager:     stateManager,
+		userID:           userID,
+		processor:        processor,
+		requestDelay:     300 * time.Millisecond, // Default request delay
+		maxRetries:       3,                      // Default max retries
+		threadExpiryDays: threadExpiryDays,
 	}
 }
 
@@ -311,8 +314,8 @@ func (tm *ThreadManager) batchCheckForThreads(channelID string, messageTSs []str
 					ChannelType: channelType,
 				}
 
-				// Add the message to the output channel
-				tm.tryAddUniqueMessage(threadMessage)
+				// Send the message to the processor (FeedAggregator)
+				tm.processor.addMessage(threadMessage)
 			}
 
 			// Handle pagination for large threads if needed
@@ -364,8 +367,8 @@ func (tm *ThreadManager) batchCheckForThreads(channelID string, messageTSs []str
 						ChannelType: channelType,
 					}
 
-					// Add to message feed
-					tm.tryAddUniqueMessage(threadMessage)
+					// Send the message to the processor (FeedAggregator)
+					tm.processor.addMessage(threadMessage)
 				}
 
 				hasMore = moreHasMore
@@ -519,8 +522,8 @@ func (tm *ThreadManager) checkThreadUpdates(channelID, threadTS string, lastKnow
 				ChannelType: channelType,
 			}
 
-			// Add to message feed
-			tm.tryAddUniqueMessage(threadMessage)
+			// Send the message to the processor (FeedAggregator)
+			tm.processor.addMessage(threadMessage)
 			processedCount++
 		}
 	}
@@ -633,8 +636,8 @@ func (tm *ThreadManager) checkThreadUpdates(channelID, threadTS string, lastKnow
 					ChannelType: channelType,
 				}
 
-				// Add to message feed
-				tm.tryAddUniqueMessage(threadMessage)
+				// Send the message to the processor (FeedAggregator)
+				tm.processor.addMessage(threadMessage)
 				processedCount++
 			}
 		}
@@ -886,44 +889,6 @@ func (tm *ThreadManager) getActiveThreadsSnapshot() map[string]map[string]Thread
 	return result
 }
 
-// tryAddUniqueMessage adds a message only if it doesn't already exist
-func (tm *ThreadManager) tryAddUniqueMessage(msg Message) {
-	// First check if we've already processed this message
-	tm.processedMu.Lock()
-	messageKey := fmt.Sprintf("%s:%s", msg.Channel, msg.Timestamp)
-	if tm.processedMessages[messageKey] {
-		log.Trace().
-			Str("user", msg.User).
-			Str("userName", tm.getUserDisplayName(msg.User)).
-			Str("timestamp", msg.Timestamp).
-			Str("channelID", msg.Channel).
-			Str("channelName", tm.getChannelDisplayName(msg.Channel)).
-			Msg("Skipping already processed message")
-		tm.processedMu.Unlock()
-		return
-	}
-
-	// Mark as processed to prevent duplicates
-	tm.processedMessages[messageKey] = true
-	tm.processedMu.Unlock()
-
-	// Send to output channel
-	select {
-	case tm.outputCh <- msg:
-		log.Debug().
-			Str("timestamp", msg.Timestamp).
-			Str("channelID", msg.Channel).
-			Str("channelName", tm.getChannelDisplayName(msg.Channel)).
-			Msg("Message sent to output channel")
-	default:
-		log.Warn().
-			Str("timestamp", msg.Timestamp).
-			Str("channelID", msg.Channel).
-			Str("channelName", tm.getChannelDisplayName(msg.Channel)).
-			Msg("Output channel full, message dropped")
-	}
-}
-
 // getChannelDisplayName returns a human-readable name for a channel
 func (tm *ThreadManager) getChannelDisplayName(channelID string) string {
 	if channel, ok := tm.channelInfo[channelID]; ok {
@@ -948,12 +913,4 @@ func (tm *ThreadManager) getChannelDisplayName(channelID string) string {
 
 	// Fallback
 	return channelID
-}
-
-// getUserDisplayName returns a human-readable name for a user
-func (tm *ThreadManager) getUserDisplayName(userID string) string {
-	if user, ok := tm.userInfo[userID]; ok {
-		return user.RealName
-	}
-	return userID
 }

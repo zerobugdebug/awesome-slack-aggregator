@@ -172,7 +172,7 @@ func (fa *FeedAggregator) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Initialize and start the thread manager (new)
+	// Initialize and start the thread manager
 	log.Debug().Msg("Initializing thread manager")
 	fa.threadManager = NewThreadManager(
 		fa.client,
@@ -180,9 +180,8 @@ func (fa *FeedAggregator) Start(ctx context.Context) error {
 		fa.userInfo,
 		fa.stateManager,
 		fa.userID,
-		fa.outputCh,
-		7, // threadExpiryDays
-		fa.processedMessages,
+		fa, // Pass the FeedAggregator as ThreadProcessor
+		fa.threadExpiryDays,
 	)
 	log.Debug().Msg("Starting thread manager")
 	fa.threadManager.Start(ctx)
@@ -721,60 +720,6 @@ func (fa *FeedAggregator) processOutputChannel(ctx context.Context) {
 				Str("timestamp", msg.Timestamp).
 				Msg("Processing output message")
 
-			// Format the message
-			//userName := msg.User
-			if user, ok := fa.userInfo[msg.User]; ok {
-				userName := user.RealName
-				log.Trace().
-					Str("userID", msg.User).
-					Str("userName", userName).
-					Msg("Resolved user name")
-			} else {
-				log.Trace().
-					Str("userID", msg.User).
-					Msg("Could not resolve user name")
-			}
-
-			//channelName := msg.Channel
-			if channel, ok := fa.channelInfo[msg.Channel]; ok {
-				channelName := channel.Name
-				log.Trace().
-					Str("channelID", msg.Channel).
-					Str("channelName", channelName).
-					Msg("Resolved channel name")
-
-				// For DMs, use the other user's name
-				if channel.IsIM {
-					for userID := range fa.userInfo {
-						if channel.User == userID {
-							log.Trace().
-								Str("channelID", msg.Channel).
-								Str("dmWithUser", fa.userInfo[userID].RealName).
-								Msg("Resolved DM channel name")
-							break
-						}
-					}
-				}
-			} else {
-				log.Trace().
-					Str("channelID", msg.Channel).
-					Msg("Could not resolve channel name")
-			}
-
-			// Create message link - format: https://team-domain.slack.com/archives/CHANNEL_ID/p{TIMESTAMP_WITHOUT_DOT}
-			// Need to replace the dot in timestamp with empty string
-			linkTimestamp := strings.Replace(msg.Timestamp, ".", "", 1)
-			messageLink := fmt.Sprintf("https://%s.slack.com/archives/%s/p%s",
-				fa.teamDomain,
-				msg.Channel,
-				linkTimestamp)
-
-			log.Debug().
-				Str("timestamp", msg.Timestamp).
-				Str("linkTimestamp", linkTimestamp).
-				Str("messageLink", messageLink).
-				Msg("Created message link")
-
 			// Always log to console
 			log.Info().
 				Str("timestamp", msg.Timestamp).
@@ -1062,17 +1007,6 @@ func main() {
 			Str("targetUserID", targetUserID).
 			Msg("Target user ID set")
 	}
-
-	// Set up state directory
-	// if *stateDir == "" {
-	// 	homeDir, err := os.UserHomeDir()
-	// 	if err != nil {
-	// 		log.Error().Err(err).Msg("Could not determine home directory")
-	// 		*stateDir = ".slack-feed" // Use current directory as fallback
-	// 	} else {
-	// 		*stateDir = filepath.Join(homeDir, ".slack-feed")
-	// 	}
-	// }
 
 	log.Info().
 		Str("stateDir", *stateDir).
