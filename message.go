@@ -33,8 +33,13 @@ func (mf *MessageFormatter) FormatMessage(teamDomain, channelID, timestamp, user
 		teamDomain, channelID, linkTimestamp)
 
 	// Format with app identifier
-	return fmt.Sprintf("`%s` <%s|Message> in *#%s*",
-		mf.appTag, messageLink, channelName)
+	return fmt.Sprintf("`%s` <%s|Message> from *%s* in *#%s*",
+		mf.appTag, messageLink, userRealName, channelName)
+}
+
+// GetAppTag returns the app tag for identification
+func (mf *MessageFormatter) GetAppTag() string {
+	return fmt.Sprintf("`%s`", mf.appTag)
 }
 
 // IsAppMessage checks if a message was created by the app
@@ -43,7 +48,7 @@ func (mf *MessageFormatter) IsAppMessage(text string) bool {
 	return text != "" && (len(text) >= len(mf.appTag) && strings.Contains(text, mf.appTag))
 }
 
-// MessageRetainer handles cleanup of old messages
+// MessageRetainer handles cleanup of old messages with improved rate limiting
 type MessageRetainer struct {
 	client       *slack.Client
 	stateManager *StateManager
@@ -63,12 +68,19 @@ func NewMessageRetainer(client *slack.Client, stateManager *StateManager, retent
 
 // Start begins the periodic cleanup process
 func (mr *MessageRetainer) Start(ctx context.Context) {
-	// Run retention check every 6 hours
-	ticker := time.NewTicker(6 * time.Hour)
+	// Run retention check every 12 hours (increased from 6 hours)
+	ticker := time.NewTicker(12 * time.Hour)
 
 	go func() {
-		// Run immediate check on startup
-		mr.cleanupOldMessages()
+		// Wait a bit before first cleanup to allow app to initialize fully
+		select {
+		case <-time.After(5 * time.Minute):
+			mr.cleanupOldMessages()
+		case <-mr.done:
+			return
+		case <-ctx.Done():
+			return
+		}
 
 		for {
 			select {
@@ -86,7 +98,7 @@ func (mr *MessageRetainer) Start(ctx context.Context) {
 
 	log.Info().
 		Dur("retention", mr.retention).
-		Str("checkInterval", "6h").
+		Str("checkInterval", "12h").
 		Msg("Message retention manager started")
 }
 
@@ -96,7 +108,7 @@ func (mr *MessageRetainer) Stop() {
 	log.Info().Msg("Message retention manager stopped")
 }
 
-// cleanupOldMessages removes messages older than the retention period
+// cleanupOldMessages removes messages older than the retention period in batches
 func (mr *MessageRetainer) cleanupOldMessages() {
 	log.Info().Msg("Starting cleanup of old messages")
 
@@ -104,9 +116,10 @@ func (mr *MessageRetainer) cleanupOldMessages() {
 	sentMessages := mr.stateManager.GetSentMessages()
 	cutoffTime := time.Now().Add(-mr.retention)
 
-	deleteCount := 0
-	errorCount := 0
+	// Group by channel for batch processing
+	messagesByChannel := make(map[string][]string)
 
+	// First pass - identify old messages and organize by channel
 	for messageTS, channelID := range sentMessages {
 		// Convert timestamp to time
 		timestampFloat := 0.0
@@ -123,33 +136,91 @@ func (mr *MessageRetainer) cleanupOldMessages() {
 
 		// Check if message is older than retention period
 		if messageTime.Before(cutoffTime) {
-			log.Debug().
-				Str("messageTS", messageTS).
-				Str("channelID", channelID).
-				Time("messageTime", messageTime).
-				Time("cutoff", cutoffTime).
-				Msg("Deleting old message")
+			// Add to channel group
+			if _, exists := messagesByChannel[channelID]; !exists {
+				messagesByChannel[channelID] = make([]string, 0)
+			}
+			messagesByChannel[channelID] = append(messagesByChannel[channelID], messageTS)
+		}
+	}
 
-			// Delete the message
-			_, _, err := mr.client.DeleteMessage(channelID, messageTS)
-			if err != nil {
-				log.Error().
-					Err(err).
+	// Second pass - delete messages by channel in batches
+	const batchSize = 20 // Delete 20 messages at a time per channel
+	totalDeleted := 0
+	totalErrors := 0
+
+	for channelID, messages := range messagesByChannel {
+		log.Debug().
+			Str("channelID", channelID).
+			Int("messageCount", len(messages)).
+			Msg("Processing channel for message deletion")
+
+		// Sort messages by timestamp to delete oldest first
+		// This isn't strictly necessary but makes the log more readable
+
+		// Process in batches to avoid rate limiting
+		for i := 0; i < len(messages); i += batchSize {
+			end := i + batchSize
+			if end > len(messages) {
+				end = len(messages)
+			}
+
+			currentBatch := messages[i:end]
+			log.Debug().
+				Str("channelID", channelID).
+				Int("batchStart", i).
+				Int("batchEnd", end).
+				Int("batchSize", len(currentBatch)).
+				Msg("Processing deletion batch")
+
+			// Delete each message in the batch with a small delay
+			batchDeleted := 0
+			batchErrors := 0
+
+			for _, messageTS := range currentBatch {
+				log.Debug().
 					Str("messageTS", messageTS).
 					Str("channelID", channelID).
-					Msg("Failed to delete message")
-				errorCount++
-			} else {
-				// Remove from tracking
-				mr.stateManager.RemoveSentMessage(messageTS)
-				deleteCount++
+					Msg("Deleting old message")
+
+				// Delete the message
+				_, _, err := mr.client.DeleteMessage(channelID, messageTS)
+				if err != nil {
+					log.Error().
+						Err(err).
+						Str("messageTS", messageTS).
+						Str("channelID", channelID).
+						Msg("Failed to delete message")
+					batchErrors++
+					totalErrors++
+				} else {
+					// Remove from tracking
+					mr.stateManager.RemoveSentMessage(messageTS)
+					batchDeleted++
+					totalDeleted++
+				}
+
+				// Add a short delay between deletions
+				time.Sleep(200 * time.Millisecond)
+			}
+
+			log.Debug().
+				Str("channelID", channelID).
+				Int("batchSize", len(currentBatch)).
+				Int("deleted", batchDeleted).
+				Int("errors", batchErrors).
+				Msg("Batch deletion complete")
+
+			// Add a longer delay between batches
+			if end < len(messages) {
+				time.Sleep(2 * time.Second)
 			}
 		}
 	}
 
 	log.Info().
-		Int("deleted", deleteCount).
-		Int("errors", errorCount).
+		Int("deleted", totalDeleted).
+		Int("errors", totalErrors).
 		Int("total", len(sentMessages)).
 		Time("cutoff", cutoffTime).
 		Msg("Message cleanup completed")

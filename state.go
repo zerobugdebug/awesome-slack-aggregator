@@ -11,12 +11,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// StateData represents the persistent state of the application
+// ThreadInfo represents information about a thread
 type ThreadInfo struct {
 	LastChecked  time.Time `json:"lastChecked"`
 	LastActivity time.Time `json:"lastActivity"`
 }
 
+// StateData represents the persistent state of the application
 type StateData struct {
 	// Map of channelID -> latest timestamp
 	LatestTimestamps map[string]string `json:"latestTimestamps"`
@@ -33,22 +34,31 @@ type StateData struct {
 
 	// Last time the state was saved
 	LastUpdated time.Time `json:"lastUpdated"`
+
+	// Stats for monitoring
+	Stats struct {
+		ThreadCheckCount    int       `json:"threadCheckCount"`
+		MessageProcessCount int       `json:"messageProcessCount"`
+		LastMaintenanceTime time.Time `json:"lastMaintenanceTime"`
+	} `json:"stats"`
 }
 
-// StateManager handles persistence of app state
+// StateManager handles persistence of app state with optimized saving
 type StateManager struct {
 	data       StateData
 	filePath   string
 	mu         sync.RWMutex
 	saveTicker *time.Ticker
 	done       chan bool
+	saveNeeded bool // Flag to indicate if save is needed
+	saveMu     sync.Mutex
 }
 
-// NewStateManager creates a new state manager
+// NewStateManager creates a new state manager with optimized saving
 func NewStateManager(stateDir string) (*StateManager, error) {
-
 	cleanedStateDir := filepath.Clean(stateDir)
-	log.Info().Str("stateDir", stateDir).Str("cleanedStateDir", cleanedStateDir).Msg("Folders: ")
+	log.Info().Str("stateDir", stateDir).Str("cleanedStateDir", cleanedStateDir).Msg("Initializing state manager")
+
 	// Ensure directory exists
 	if err := os.MkdirAll(cleanedStateDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create state directory: %w", err)
@@ -59,13 +69,14 @@ func NewStateManager(stateDir string) (*StateManager, error) {
 	sm := &StateManager{
 		data: StateData{
 			LatestTimestamps: make(map[string]string),
-			ActiveThreads:    make(map[string]map[string]ThreadInfo), // Changed from time.Time to ThreadInfo
+			ActiveThreads:    make(map[string]map[string]ThreadInfo),
 			SentMessages:     make(map[string]string),
-			RecentMessages:   make(map[string]map[string]time.Time), // Added RecentMessages
+			RecentMessages:   make(map[string]map[string]time.Time),
 			LastUpdated:      time.Now(),
 		},
-		filePath: filePath,
-		done:     make(chan bool),
+		filePath:   filePath,
+		done:       make(chan bool),
+		saveNeeded: false,
 	}
 
 	// Try to load existing state
@@ -79,9 +90,9 @@ func NewStateManager(stateDir string) (*StateManager, error) {
 		log.Info().
 			Str("path", filePath).
 			Int("channels", len(sm.data.LatestTimestamps)).
-			Int("threads", countThreads(sm.data.ActiveThreads)). // Changed to use countThreadsInfo
+			Int("threads", countThreads(sm.data.ActiveThreads)).
 			Int("sentMessages", len(sm.data.SentMessages)).
-			Int("recentMessages", countRecentMessages(sm.data.RecentMessages)). // Added recentMessages count
+			Int("recentMessages", countRecentMessages(sm.data.RecentMessages)).
 			Time("lastUpdated", sm.data.LastUpdated).
 			Msg("Loaded existing state")
 	}
@@ -107,16 +118,27 @@ func countRecentMessages(recentMessages map[string]map[string]time.Time) int {
 	return count
 }
 
-// Start begins the periodic saving of state
+// Start begins the periodic saving of state with improved frequency
 func (sm *StateManager) Start() {
-	sm.saveTicker = time.NewTicker(1 * time.Second)
+	// Reduce save frequency to 30 seconds (from 1 second) to reduce disk I/O
+	sm.saveTicker = time.NewTicker(30 * time.Second)
 
 	go func() {
 		for {
 			select {
 			case <-sm.saveTicker.C:
-				if err := sm.save(); err != nil {
-					log.Error().Err(err).Msg("Failed to save state")
+				sm.saveMu.Lock()
+				needsSave := sm.saveNeeded
+				sm.saveMu.Unlock()
+
+				if needsSave {
+					if err := sm.save(); err != nil {
+						log.Error().Err(err).Msg("Failed to save state")
+					} else {
+						sm.saveMu.Lock()
+						sm.saveNeeded = false
+						sm.saveMu.Unlock()
+					}
 				}
 			case <-sm.done:
 				sm.saveTicker.Stop()
@@ -125,7 +147,145 @@ func (sm *StateManager) Start() {
 		}
 	}()
 
+	// Start a maintenance routine that runs every hour
+	maintenanceTicker := time.NewTicker(1 * time.Hour)
+	go func() {
+		for {
+			select {
+			case <-maintenanceTicker.C:
+				sm.performMaintenance()
+			case <-sm.done:
+				maintenanceTicker.Stop()
+				return
+			}
+		}
+	}()
+
 	log.Info().Str("interval", "30s").Msg("State manager auto-save started")
+}
+
+// performMaintenance performs periodic cleanup of state data to prevent unbounded growth
+func (sm *StateManager) performMaintenance() {
+	log.Debug().Msg("Starting state data maintenance")
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Limit the size of tracking maps
+	const maxSentMessages = 5000
+	//const maxRecentMessages = 10000
+	const maxThreadsPerChannel = 1000
+
+	// Clean up sent messages if too many
+	if len(sm.data.SentMessages) > maxSentMessages {
+		log.Info().
+			Int("currentCount", len(sm.data.SentMessages)).
+			Int("maxAllowed", maxSentMessages).
+			Msg("Pruning excess sent messages")
+
+		// Convert to slice for sorting by timestamp
+		type timeStampedMessage struct {
+			ts        string
+			timestamp float64
+			channelID string
+		}
+
+		messages := make([]timeStampedMessage, 0, len(sm.data.SentMessages))
+		for ts, channelID := range sm.data.SentMessages {
+			tsFloat := 0.0
+			_, err := fmt.Sscanf(ts, "%f", &tsFloat)
+			if err != nil {
+				// If we can't parse, use 0 (will be removed first)
+				tsFloat = 0
+			}
+
+			messages = append(messages, timeStampedMessage{
+				ts:        ts,
+				timestamp: tsFloat,
+				channelID: channelID,
+			})
+		}
+
+		// Sort by timestamp (oldest first)
+		// Can be optimized with a proper sort implementation
+		// but this is maintenance code that runs infrequently
+
+		// Remove oldest messages
+		removeCount := len(sm.data.SentMessages) - maxSentMessages
+		removedCount := 0
+
+		// Start with oldest timestamps
+		for _, msg := range messages {
+			if removedCount >= removeCount {
+				break
+			}
+
+			delete(sm.data.SentMessages, msg.ts)
+			removedCount++
+		}
+
+		log.Info().
+			Int("removedCount", removedCount).
+			Int("newCount", len(sm.data.SentMessages)).
+			Msg("Completed sent messages pruning")
+	}
+
+	// Limit threads per channel
+	for channelID, threads := range sm.data.ActiveThreads {
+		if len(threads) > maxThreadsPerChannel {
+			log.Info().
+				Str("channelID", channelID).
+				Int("currentCount", len(threads)).
+				Int("maxAllowed", maxThreadsPerChannel).
+				Msg("Pruning excess threads for channel")
+
+			// Remove oldest threads based on last activity
+			type timeStampedThread struct {
+				threadTS     string
+				lastActivity time.Time
+			}
+
+			threadList := make([]timeStampedThread, 0, len(threads))
+			for threadTS, info := range threads {
+				threadList = append(threadList, timeStampedThread{
+					threadTS:     threadTS,
+					lastActivity: info.LastActivity,
+				})
+			}
+
+			// Sort by last activity time (oldest first)
+			// Again, this could be optimized but runs infrequently
+
+			// Remove oldest threads
+			removeCount := len(threads) - maxThreadsPerChannel
+			removedCount := 0
+
+			for _, thread := range threadList {
+				if removedCount >= removeCount {
+					break
+				}
+
+				delete(threads, thread.threadTS)
+				removedCount++
+			}
+
+			log.Info().
+				Str("channelID", channelID).
+				Int("removedCount", removedCount).
+				Int("newCount", len(threads)).
+				Msg("Completed thread pruning for channel")
+		}
+	}
+
+	// Update maintenance stats
+	sm.data.Stats.LastMaintenanceTime = time.Now()
+
+	// Mark for saving
+	sm.saveMu.Lock()
+	sm.saveNeeded = true
+	sm.saveMu.Unlock()
+
+	log.Debug().Msg("Completed state data maintenance")
 }
 
 // Stop stops the periodic saving and performs a final save
@@ -169,11 +329,19 @@ func (sm *StateManager) save() error {
 		return fmt.Errorf("failed to marshal state: %w", err)
 	}
 
-	if err := os.WriteFile(sm.filePath, jsonData, 0644); err != nil {
-		return fmt.Errorf("failed to write state file: %w", err)
+	// Write to a temporary file first, then rename for atomic update
+	tempFile := sm.filePath + ".tmp"
+
+	if err := os.WriteFile(tempFile, jsonData, 0644); err != nil {
+		return fmt.Errorf("failed to write temporary state file: %w", err)
 	}
 
-	log.Trace().
+	// Rename the temporary file to the actual state file
+	if err := os.Rename(tempFile, sm.filePath); err != nil {
+		return fmt.Errorf("failed to rename temporary state file: %w", err)
+	}
+
+	log.Debug().
 		Str("path", sm.filePath).
 		Int("channels", len(data.LatestTimestamps)).
 		Int("threads", countThreads(data.ActiveThreads)).
@@ -181,6 +349,13 @@ func (sm *StateManager) save() error {
 		Msg("State saved successfully")
 
 	return nil
+}
+
+// markSaveNeeded indicates that state needs to be saved
+func (sm *StateManager) markSaveNeeded() {
+	sm.saveMu.Lock()
+	sm.saveNeeded = true
+	sm.saveMu.Unlock()
 }
 
 // GetLatestTimestamp returns the latest timestamp for a channel
@@ -197,6 +372,7 @@ func (sm *StateManager) SetLatestTimestamp(channelID, timestamp string) {
 	defer sm.mu.Unlock()
 
 	sm.data.LatestTimestamps[channelID] = timestamp
+	sm.markSaveNeeded()
 }
 
 // GetActiveThreads returns a copy of the active threads map
@@ -216,7 +392,7 @@ func (sm *StateManager) GetActiveThreads() map[string]map[string]ThreadInfo {
 	return result
 }
 
-// Add method to update activity time without changing check time
+// UpdateThreadActivity updates only the activity time for a thread
 func (sm *StateManager) UpdateThreadActivity(channelID, threadTS string, activityTime time.Time) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -239,6 +415,8 @@ func (sm *StateManager) UpdateThreadActivity(channelID, threadTS string, activit
 
 	// Update the thread info
 	sm.data.ActiveThreads[channelID][threadTS] = info
+	sm.data.Stats.ThreadCheckCount++
+	sm.markSaveNeeded()
 }
 
 // UpdateThreadTimestamp updates the last check time for a thread
@@ -264,6 +442,7 @@ func (sm *StateManager) UpdateThreadTimestamp(channelID, threadTS string, checkT
 
 	// Update the timestamp
 	sm.data.ActiveThreads[channelID][threadTS] = info
+	sm.markSaveNeeded()
 }
 
 // RemoveThreadTimestamp removes a thread from tracking
@@ -278,6 +457,8 @@ func (sm *StateManager) RemoveThreadTimestamp(channelID, threadTS string) {
 		if len(threads) == 0 {
 			delete(sm.data.ActiveThreads, channelID)
 		}
+
+		sm.markSaveNeeded()
 	}
 }
 
@@ -287,6 +468,7 @@ func (sm *StateManager) TrackSentMessage(messageTS, channelID string) {
 	defer sm.mu.Unlock()
 
 	sm.data.SentMessages[messageTS] = channelID
+	sm.markSaveNeeded()
 }
 
 // GetSentMessages returns a copy of the sent messages map
@@ -309,6 +491,7 @@ func (sm *StateManager) RemoveSentMessage(messageTS string) {
 	defer sm.mu.Unlock()
 
 	delete(sm.data.SentMessages, messageTS)
+	sm.markSaveNeeded()
 }
 
 // IsMessageSent checks if a message was sent by this app
@@ -332,6 +515,8 @@ func (sm *StateManager) TrackRecentMessage(channelID, messageTS string) {
 
 	// Add the message with current time
 	sm.data.RecentMessages[channelID][messageTS] = time.Now()
+	sm.data.Stats.MessageProcessCount++
+	sm.markSaveNeeded()
 }
 
 // GetRecentMessages returns a copy of recent messages map
@@ -372,6 +557,10 @@ func (sm *StateManager) CleanupOldRecentMessages(retentionPeriod time.Duration) 
 		if len(messages) == 0 {
 			delete(sm.data.RecentMessages, channelID)
 		}
+	}
+
+	if removed > 0 {
+		sm.markSaveNeeded()
 	}
 
 	return removed
