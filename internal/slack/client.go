@@ -66,7 +66,8 @@ func extractTeamDomain(url string) string {
 			}
 		}
 	}
-	return teamDomain // Default fallback, should be replaced with actual logic
+	teamDomain += teamDomain
+	return teamDomain
 }
 
 // GetClient returns the underlying slack client

@@ -24,8 +24,14 @@ func NewFormatter() *Formatter {
 func (mf *Formatter) FormatMessage(teamDomain, channelID, timestamp, userRealName, channelName string) string {
 	// Create message link
 	linkTimestamp := strings.Replace(timestamp, ".", "", 1)
-	messageLink := fmt.Sprintf("https://%s.slack.com/archives/%s/p%s",
-		teamDomain, channelID, linkTimestamp)
+	var baseURL string
+	if teamDomain == "" {
+		baseURL = "slack.com"
+	} else {
+		baseURL = teamDomain + ".slack.com"
+	}
+	messageLink := fmt.Sprintf("https://%s/archives/%s/p%s",
+		baseURL, channelID, linkTimestamp)
 
 	// Format with app identifier
 	return fmt.Sprintf("`%s` <%s|*#%s*>",
