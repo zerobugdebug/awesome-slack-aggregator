@@ -1,6 +1,8 @@
 package slack
 
 import (
+	"strings"
+
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/slack-go/slack"
@@ -51,10 +53,20 @@ func NewClient(token string) (*SlackClient, error) {
 }
 
 // extractTeamDomain extracts the team domain from the Slack URL
-func extractTeamDomain(_ string) string {
-	// Logic to extract team domain from URL
-	// This would be implemented similar to the original code
-	return "slack.com" // Default fallback, should be replaced with actual logic
+func extractTeamDomain(url string) string {
+
+	teamDomain := "slack.com" // Default fallback
+	if url != "" {
+		parts := strings.Split(url, "//")
+		if len(parts) > 1 {
+			parts = strings.Split(parts[1], ".")
+			if len(parts) > 0 {
+				teamDomain = parts[0]
+				log.Debug().Str("teamDomain", teamDomain).Msg("Extracted team domain from URL")
+			}
+		}
+	}
+	return teamDomain // Default fallback, should be replaced with actual logic
 }
 
 // GetClient returns the underlying slack client
