@@ -55,7 +55,7 @@ func NewClient(token string) (*SlackClient, error) {
 // extractTeamDomain extracts the team domain from the Slack URL
 func extractTeamDomain(url string) string {
 
-	teamDomain := "slack.com" // Default fallback
+	teamDomain := ""
 	if url != "" {
 		parts := strings.Split(url, "//")
 		if len(parts) > 1 {
@@ -66,7 +66,6 @@ func extractTeamDomain(url string) string {
 			}
 		}
 	}
-	teamDomain += teamDomain
 	return teamDomain
 }
 
