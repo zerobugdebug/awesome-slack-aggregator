@@ -28,8 +28,8 @@ func (mf *Formatter) FormatMessage(teamDomain, channelID, timestamp, userRealNam
 		teamDomain, channelID, linkTimestamp)
 
 	// Format with app identifier
-	return fmt.Sprintf("`%s` <%s|Message> from *%s* in *#%s*",
-		mf.appTag, messageLink, userRealName, channelName)
+	return fmt.Sprintf("`%s` <%s|*#%s*>",
+		mf.appTag, messageLink, channelName)
 }
 
 // GetAppTag returns the app tag for identification

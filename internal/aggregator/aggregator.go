@@ -3,7 +3,6 @@ package aggregator
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -604,114 +603,116 @@ func (agg *Aggregator) processOutputChannel(ctx context.Context) {
 // Extract the batch sending logic to a helper function
 func sendBatch(agg *Aggregator, batchMessages []models.Message, targetChannelID string) {
 	// For larger batches, use a single API call with blocks
-	if len(batchMessages) > 3 {
-		// Combine messages into one post with blocks
-		blocks := []slack.Block{}
+	// if len(batchMessages) > 1 {
+	// 	// Combine messages into one post with blocks
+	// 	//blocks := []slack.Block{}
+	// 	messageText := ""
 
-		for _, batchMsg := range batchMessages {
-			userName := agg.getUserDisplayName(batchMsg.User)
-			channelName := agg.getChannelDisplayName(batchMsg.Channel)
+	// 	for _, batchMsg := range batchMessages {
+	// 		userName := agg.getUserDisplayName(batchMsg.User)
+	// 		channelName := agg.getChannelDisplayName(batchMsg.Channel)
 
-			// Create message link
-			linkTimestamp := strings.Replace(batchMsg.Timestamp, ".", "", 1)
-			messageLink := fmt.Sprintf("https://%s.slack.com/archives/%s/p%s",
-				agg.teamDomain, batchMsg.Channel, linkTimestamp)
+	// 		// Create message link
+	// 		//linkTimestamp := strings.Replace(batchMsg.Timestamp, ".", "", 1)
+	// 		//messageLink := fmt.Sprintf("https://%s.slack.com/archives/%s/p%s",
+	// 		//	agg.teamDomain, batchMsg.Channel, linkTimestamp)
 
-			// Format message with our marker
-			// messageText := agg.messageFormatter.FormatMessage(
-			// 	agg.teamDomain,
-			// 	batchMsg.Channel,
-			// 	batchMsg.Timestamp,
-			// 	userName,
-			// 	channelName,
-			// )
+	// 		// Format message with our marker
+	// 		messageText += agg.messageFormatter.FormatMessage(
+	// 			agg.teamDomain,
+	// 			batchMsg.Channel,
+	// 			batchMsg.Timestamp,
+	// 			userName,
+	// 			channelName,
+	// 		)
 
-			// Create a section block for this message
-			headerText := slack.NewTextBlockObject(
-				"mrkdwn",
-				fmt.Sprintf("*%s* in #%s - <%s|View Message>",
-					userName, channelName, messageLink),
-				false, false)
+	// 		// // Create a section block for this message
+	// 		// headerText := slack.NewTextBlockObject(
+	// 		// 	"mrkdwn",
+	// 		// 	fmt.Sprintf("*%s* in #%s - <%s|View Message>",
+	// 		// 		userName, channelName, messageLink),
+	// 		// 	false, false)
 
-			// Add a divider if it's not the first message
-			if len(blocks) > 0 {
-				blocks = append(blocks, slack.NewDividerBlock())
-			}
+	// 		// // Add a divider if it's not the first message
+	// 		// if len(blocks) > 0 {
+	// 		// 	blocks = append(blocks, slack.NewDividerBlock())
+	// 		// }
 
-			// Add the header section
-			blocks = append(blocks, slack.NewSectionBlock(headerText, nil, nil))
+	// 		// // Add the header section
+	// 		// blocks = append(blocks, slack.NewSectionBlock(headerText, nil, nil))
 
-			// Add the app tag as context
-			appTag := slack.NewTextBlockObject(
-				"mrkdwn",
-				agg.messageFormatter.GetAppTag(),
-				false, false)
-			blocks = append(blocks, slack.NewContextBlock(
-				"",
-				slack.MixedElement(appTag),
-			))
-		}
+	// 		// // Add the app tag as context
+	// 		// appTag := slack.NewTextBlockObject(
+	// 		// 	"mrkdwn",
+	// 		// 	agg.messageFormatter.GetAppTag(),
+	// 		// 	false, false)
+	// 		// blocks = append(blocks, slack.NewContextBlock(
+	// 		// 	"",
+	// 		// 	slack.MixedElement(appTag),
+	// 		// ))
+	// 	}
 
-		// Send the batch as a single message with blocks
-		_, timestamp, err := agg.client.PostMessage(
-			targetChannelID,
-			slack.MsgOptionBlocks(blocks...),
+	// 	// Send the batch as a single message with blocks
+	// 	_, timestamp, err := agg.client.PostMessage(
+	// 		targetChannelID,
+	// 		slack.MsgOptionBlocks(blocks...),
+	// 	)
+
+	// 	if err != nil {
+	// 		log.Error().
+	// 			Err(err).
+	// 			Str("targetChannelID", targetChannelID).
+	// 			Int("batchSize", len(batchMessages)).
+	// 			Msg("Error sending batch message")
+	// 	} else {
+	// 		log.Debug().
+	// 			Str("targetChannelID", targetChannelID).
+	// 			Int("batchSize", len(batchMessages)).
+	// 			Str("timestamp", timestamp).
+	// 			Msg("Batch message sent successfully")
+
+	// 		// Track this message for retention
+	// 		agg.stateManager.TrackSentMessage(timestamp, targetChannelID)
+	// 	}
+	// } else {
+	// For smaller batches, use the original approach
+	// Process each message in the batch
+	messageText := ""
+	for _, batchMsg := range batchMessages {
+		userName := agg.getUserDisplayName(batchMsg.User)
+		channelName := agg.getChannelDisplayName(batchMsg.Channel)
+
+		// Format message with our marker
+		messageText += agg.messageFormatter.FormatMessage(
+			agg.teamDomain,
+			batchMsg.Channel,
+			batchMsg.Timestamp,
+			userName,
+			channelName,
 		)
-
-		if err != nil {
-			log.Error().
-				Err(err).
-				Str("targetChannelID", targetChannelID).
-				Int("batchSize", len(batchMessages)).
-				Msg("Error sending batch message")
-		} else {
-			log.Debug().
-				Str("targetChannelID", targetChannelID).
-				Int("batchSize", len(batchMessages)).
-				Str("timestamp", timestamp).
-				Msg("Batch message sent successfully")
-
-			// Track this message for retention
-			agg.stateManager.TrackSentMessage(timestamp, targetChannelID)
-		}
-	} else {
-		// For smaller batches, use the original approach
-		// Process each message in the batch
-		for _, batchMsg := range batchMessages {
-			userName := agg.getUserDisplayName(batchMsg.User)
-			channelName := agg.getChannelDisplayName(batchMsg.Channel)
-
-			// Format message with our marker
-			messageText := agg.messageFormatter.FormatMessage(
-				agg.teamDomain,
-				batchMsg.Channel,
-				batchMsg.Timestamp,
-				userName,
-				channelName,
-			)
-
-			// Send to target channel
-			_, timestamp, err := agg.client.PostMessage(
-				targetChannelID,
-				slack.MsgOptionText(messageText, false),
-			)
-
-			if err != nil {
-				log.Error().
-					Err(err).
-					Str("targetChannelID", targetChannelID).
-					Str("targetChannelName", agg.getChannelDisplayName(targetChannelID)).
-					Msg("Error sending message to channel")
-			} else {
-				log.Debug().
-					Str("targetChannelID", targetChannelID).
-					Str("targetChannelName", agg.getChannelDisplayName(targetChannelID)).
-					Str("timestamp", timestamp).
-					Msg("Message sent successfully")
-
-				// Track this message for retention
-				agg.stateManager.TrackSentMessage(timestamp, targetChannelID)
-			}
-		}
 	}
+
+	// Send to target channel
+	_, timestamp, err := agg.client.PostMessage(
+		targetChannelID,
+		slack.MsgOptionText(messageText, false),
+	)
+
+	if err != nil {
+		log.Error().
+			Err(err).
+			Str("targetChannelID", targetChannelID).
+			Str("targetChannelName", agg.getChannelDisplayName(targetChannelID)).
+			Msg("Error sending message to channel")
+	} else {
+		log.Debug().
+			Str("targetChannelID", targetChannelID).
+			Str("targetChannelName", agg.getChannelDisplayName(targetChannelID)).
+			Str("timestamp", timestamp).
+			Msg("Message sent successfully")
+
+		// Track this message for retention
+		agg.stateManager.TrackSentMessage(timestamp, targetChannelID)
+	}
+
 }
