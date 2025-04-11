@@ -1,64 +1,27 @@
-package main
+package message
 
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/slack-go/slack"
+
+	"github.com/zerobugdebug/awesome-slack-aggregator/internal/state"
 )
 
-// MessageFormatter handles formatting of messages sent by the app
-type MessageFormatter struct {
-	appTag string // The identifier tag for app messages
-}
-
-// NewMessageFormatter creates a new formatter with a unique ID
-func NewMessageFormatter() *MessageFormatter {
-	// Create a unique identifier for this instance
-	uniqueID := "FpHZFpdW"
-
-	return &MessageFormatter{
-		appTag: uniqueID,
-	}
-}
-
-// FormatMessage formats a message link for sending
-func (mf *MessageFormatter) FormatMessage(teamDomain, channelID, timestamp, userRealName, channelName string) string {
-	// Create message link
-	linkTimestamp := strings.Replace(timestamp, ".", "", 1)
-	messageLink := fmt.Sprintf("https://%s.slack.com/archives/%s/p%s",
-		teamDomain, channelID, linkTimestamp)
-
-	// Format with app identifier
-	return fmt.Sprintf("`%s` <%s|Message> from *%s* in *#%s*",
-		mf.appTag, messageLink, userRealName, channelName)
-}
-
-// GetAppTag returns the app tag for identification
-func (mf *MessageFormatter) GetAppTag() string {
-	return fmt.Sprintf("`%s`", mf.appTag)
-}
-
-// IsAppMessage checks if a message was created by the app
-func (mf *MessageFormatter) IsAppMessage(text string) bool {
-	// Look for our special comment marker
-	return text != "" && (len(text) >= len(mf.appTag) && strings.Contains(text, mf.appTag))
-}
-
-// MessageRetainer handles cleanup of old messages with improved rate limiting
-type MessageRetainer struct {
+// Retainer handles cleanup of old messages with improved rate limiting
+type Retainer struct {
 	client       *slack.Client
-	stateManager *StateManager
+	stateManager *state.Manager
 	retention    time.Duration
 	done         chan bool
 }
 
-// NewMessageRetainer creates a new message retention manager
-func NewMessageRetainer(client *slack.Client, stateManager *StateManager, retentionDays int) *MessageRetainer {
-	return &MessageRetainer{
+// NewRetainer creates a new message retention manager
+func NewRetainer(client *slack.Client, stateManager *state.Manager, retentionDays int) *Retainer {
+	return &Retainer{
 		client:       client,
 		stateManager: stateManager,
 		retention:    time.Duration(retentionDays) * 24 * time.Hour,
@@ -67,8 +30,8 @@ func NewMessageRetainer(client *slack.Client, stateManager *StateManager, retent
 }
 
 // Start begins the periodic cleanup process
-func (mr *MessageRetainer) Start(ctx context.Context) {
-	// Run retention check every 12 hours (increased from 6 hours)
+func (mr *Retainer) Start(ctx context.Context) {
+	// Run retention check every 12 hours
 	ticker := time.NewTicker(12 * time.Hour)
 
 	go func() {
@@ -103,13 +66,13 @@ func (mr *MessageRetainer) Start(ctx context.Context) {
 }
 
 // Stop terminates the cleanup process
-func (mr *MessageRetainer) Stop() {
+func (mr *Retainer) Stop() {
 	mr.done <- true
 	log.Info().Msg("Message retention manager stopped")
 }
 
 // cleanupOldMessages removes messages older than the retention period in batches
-func (mr *MessageRetainer) cleanupOldMessages() {
+func (mr *Retainer) cleanupOldMessages() {
 	log.Info().Msg("Starting cleanup of old messages")
 
 	// Get messages sent by the app
@@ -154,9 +117,6 @@ func (mr *MessageRetainer) cleanupOldMessages() {
 			Str("channelID", channelID).
 			Int("messageCount", len(messages)).
 			Msg("Processing channel for message deletion")
-
-		// Sort messages by timestamp to delete oldest first
-		// This isn't strictly necessary but makes the log more readable
 
 		// Process in batches to avoid rate limiting
 		for i := 0; i < len(messages); i += batchSize {
